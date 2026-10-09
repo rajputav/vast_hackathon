@@ -379,6 +379,53 @@ def _neighbor_record(segment: dict | None) -> dict | None:
     }
 
 
+# A claim about impact. Only here can the physical record (a speed spike) speak to the element.
+CONTACT_WORDS = re.compile(
+    r"\b(struck|strikes?|striking|hit|hits|collid\w*|collision|crash\w*|knock\w*|ran over|runs? over|"
+    r"attack\w*|ramm?\w*|slam\w*|impact\w*)\b",
+    re.IGNORECASE,
+)
+
+
+def is_contact_claim(claim: str) -> bool:
+    return bool(CONTACT_WORDS.search(claim))
+
+
+def impeach(claim: str, segment: dict, subpoena: dict) -> dict | None:
+    """Physical record against the witness's characterization.
+
+    The witness is a vision model and it is good at facts it can see (is there contact; is the
+    forklift there) and unreliable at characterizing them (it called a collision "the person
+    pushing the forklift", then "the forklift collides with the person", in the same minute). On a
+    contact claim, when it confirms contact and the foundation but denies the claim as worded, and
+    the detector's own track shows the person's speed jumping abruptly, the court finds the
+    characterization impeached: a person pushing or walking does not triple their speed in a
+    fraction of a second. Returns the finding, or None if the rule does not apply.
+    """
+    if not is_contact_claim(claim):
+        return None
+    pe = physical_evidence(segment)
+    if not pe or not pe.get("abrupt_change"):
+        return None
+    answers = subpoena.get("answers") or []
+    if len(answers) < 2:
+        return None
+    claim_answer, rest = answers[0], answers[1:]
+    if claim_answer["answer"] != "no" or not all(a["answer"] == "yes" for a in rest):
+        return None
+    confirmed = "; ".join(f"'{a['question']}' — yes" for a in rest)
+    return {
+        "ground": "physical",
+        "line": (
+            f"The witness denies the claim as worded but confirms {confirmed}. The detector's track shows the "
+            f"person's speed jumping from {pe['person_speed_median_px_s']} to {pe['person_speed_peak_px_s']} px/s "
+            f"(×{pe['spike_ratio']}) at {pe['peak_at_sec']}s. A person pushing or walking does not accelerate like "
+            "that; a person struck does. The witness's characterization is impeached by the physical record; the "
+            "exhibit is admitted."
+        ),
+    }
+
+
 def try_exhibit(claim: str, n: int, segment: dict, camera: str | None, may_view: bool) -> dict:
     """Run one exhibit through prosecution, defense, the judge on the papers, then the tape.
 
@@ -398,13 +445,18 @@ def try_exhibit(claim: str, n: int, segment: dict, camera: str | None, may_view:
         view_tape(segment["id"], claim_question(claim), judge["question"], judge["foundation"]) if may_view else None
     )
     struck_for: str | None = None
+    finding: dict | None = None
     if subpoena is None:
         disposition = "STRIKE" if judge["ruling"] == "STRIKE" else "NOT_REACHED"
         struck_for = "objection" if disposition == "STRIKE" else None
     else:
         disposition = LOOK_TO_RULING[subpoena["answer"]]
         if disposition == "STRIKE":
-            struck_for = "unclear" if subpoena["answer"] == "unclear" else "tape"
+            finding = impeach(claim, segment, subpoena)
+            if finding:
+                disposition = "ADMIT"
+            else:
+                struck_for = "unclear" if subpoena["answer"] == "unclear" else "tape"
 
     # The tape witness is the Cosmos endpoint; the caption came from a Cosmos model too. When they
     # are the same model, the tape agreeing with the caption is the same witness twice, not
@@ -425,6 +477,7 @@ def try_exhibit(claim: str, n: int, segment: dict, camera: str | None, may_view:
         "judge": judge,
         "subpoena": subpoena,
         "shared_witness": shared_witness,
+        "finding": finding,
         "disposition": disposition,
         "struck_for": struck_for,
     }
@@ -469,10 +522,13 @@ def exhibit_lines(record: dict) -> list[str]:
         if record.get("shared_witness"):
             lines.append(f"  THE COURT NOTES: the tape witness ({sub.get('witness')}) is the model that wrote "
                          "the caption; their agreement is one witness heard twice, not corroboration.")
+        if record.get("finding"):
+            lines.append(f"  THE COURT FINDS: {record['finding']['line']}")
     elif record["disposition"] == "NOT_REACHED":
         lines.append("  THE COURT DECLINES TO VIEW THE TAPE: subpoena budget exhausted; exhibit not reached.")
     lines.append(f"  RULING:      {record['disposition']}"
-                 + (f" ({record['struck_for']})" if record["struck_for"] else ""))
+                 + (f" ({record['struck_for']})" if record["struck_for"] else "")
+                 + (" (witness impeached by the physical record)" if record.get("finding") else ""))
     lines.append("")
     return lines
 

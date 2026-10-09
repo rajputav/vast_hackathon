@@ -327,10 +327,12 @@ function renderExhibit(r) {
       right += line('THE COURT FINDS', `<b>${esc(r.subpoena.answer)}</b> — the answers do not agree.`);
     if (r.shared_witness)
       right += line('THE COURT', `<span class="muted">notes that the tape witness (${esc(r.subpoena.witness)}) is the model that wrote the caption; their agreement is one witness heard twice, not corroboration.</span>`);
+    if (r.finding)
+      right += line('THE COURT FINDS', `<b>witness impeached.</b> ${esc(r.finding.line)}`);
   } else if (r.disposition === 'NOT_REACHED') {
     right += line('THE COURT', '<span class="muted">declines to view the tape: tape cap reached; exhibit not reached.</span>');
   }
-  const why = r.disposition === 'STRIKE' ? (r.struck_for || '') : r.disposition === 'NOT_REACHED' ? 'not counted' : '';
+  const why = r.disposition === 'STRIKE' ? (r.struck_for || '') : r.disposition === 'NOT_REACHED' ? 'not counted' : r.finding ? 'on the physical record' : '';
   const stampText = { ADMIT:'Admitted', STRIKE:'Struck', NOT_REACHED:'Not reached' }[r.disposition] || r.disposition;
   const where = `${r.camera ? esc(r.camera) + ' · ' : ''}${esc(r.chunk)} @ ${Number(seg.ts)}s`;
   const nbHtml = (nb.prev || nb.next) ? `<div class="nb">` +
