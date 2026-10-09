@@ -258,7 +258,7 @@ def _run_trial(trial: Trial) -> None:
             trial.publish(event)
     except Exception as exc:  # the UI needs to hear about it, not a dead stream
         trial.error = f"{type(exc).__name__}: {exc}"[:300]
-        trial.publish({"type": "error", "error": trial.error})
+        trial.publish({"type": "failed", "error": trial.error})  # not "error": that is EventSource's own event
     finally:
         trial.finish()
 

@@ -3,55 +3,301 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VSS Starter</title>
+<title>Exhibit A — the video archive on trial</title>
 <style>
-  body { margin: 0; padding: 20px 16px; background: #0f1115; color: #e8eaee; font: 14px/1.45 system-ui, sans-serif; }
-  .wrap { max-width: 1100px; margin: 0 auto; }
-  h1 { font-size: 18px; margin: 0 0 12px; }
-  input { padding: 8px 10px; width: min(100%, 420px); border-radius: 6px; border: 1px solid #2a2f3a; background: #181b22; color: inherit; }
-  button { padding: 7px 12px; border-radius: 6px; border: 1px solid #2a2f3a; background: #1f232c; color: inherit; cursor: pointer; }
-  button:disabled { opacity: .5; }
-  .muted { color: #9aa2b1; font-size: 12px; }
-  .ok { color: #3fb950; } .bad { color: #f85149; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); gap: 12px; margin-top: 12px; }
-  .card { background: #181b22; border: 1px solid #2a2f3a; border-radius: 8px; padding: 8px; }
-  video { width: 100%; aspect-ratio: 16/9; background: #000; border-radius: 4px; }
-  p { margin: 6px 0; font-size: 12px; white-space: pre-wrap; }
+  :root { --bg:#0f1115; --panel:#181b22; --line:#2a2f3a; --fg:#e8eaee; --muted:#9aa2b1;
+          --ok:#3fb950; --bad:#f85149; --warn:#d29922; --pros:#f0883e; --def:#58a6ff; --judge:#d2a8ff; --tape:#39d353; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:20px 16px 60px; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, sans-serif; }
+  .wrap { max-width:1180px; margin:0 auto; }
+  h1 { font-size:22px; margin:0 0 2px; letter-spacing:.2px; }
+  h1 small { font-size:13px; color:var(--muted); font-weight:normal; margin-left:8px; }
+  .muted { color:var(--muted); font-size:12px; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
+  input, select { padding:8px 10px; border-radius:6px; border:1px solid var(--line); background:var(--panel); color:inherit; font:inherit; }
+  button { padding:8px 14px; border-radius:6px; border:1px solid var(--line); background:#1f232c; color:inherit; cursor:pointer; font:inherit; }
+  button.primary { background:#2b3b55; border-color:#3a5281; font-weight:600; }
+  button:disabled { opacity:.5; cursor:default; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
+
+  /* claim form */
+  #claimform { display:grid; grid-template-columns: 1fr; gap:10px; margin-top:14px; }
+  #claimform .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  #claim { flex:1 1 420px; font-size:15px; }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; }
+  .chip { font-size:12px; padding:4px 9px; border-radius:999px; border:1px solid var(--line); background:#13161c; color:var(--muted); cursor:pointer; }
+  .chip:hover { color:var(--fg); border-color:#3a4150; }
+  label.small { font-size:12px; color:var(--muted); display:flex; align-items:center; gap:6px; }
+  label.small input { width:64px; }
+
+  /* session line */
+  #session { margin:16px 0 8px; display:flex; align-items:center; gap:10px; min-height:22px; }
+  .gavel { width:10px; height:10px; border-radius:50%; background:var(--warn); box-shadow:0 0 0 0 rgba(210,153,34,.6); animation:pulse 1.4s infinite; }
+  @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(210,153,34,.6)} 70%{box-shadow:0 0 0 9px rgba(210,153,34,0)} 100%{box-shadow:0 0 0 0 rgba(210,153,34,0)} }
+  .gavel.idle { animation:none; background:#444b5a; box-shadow:none; }
+
+  /* exhibits */
+  .exhibit { display:grid; grid-template-columns: minmax(260px, 360px) 1fr; gap:14px; margin-top:12px; padding:12px; position:relative; }
+  @media (max-width: 760px) { .exhibit { grid-template-columns: 1fr; } }
+  .exhibit.pending { opacity:.45; }
+  .exhibit.pending .right::after { content:'awaiting the court…'; color:var(--muted); font-style:italic; font-size:12px; }
+  .exhibit h3 { margin:0 0 6px; font-size:13px; color:var(--muted); font-weight:600; letter-spacing:.4px; text-transform:uppercase; }
+  video { width:100%; aspect-ratio:16/9; background:#000; border-radius:6px; }
+  .yolo { display:flex; flex-wrap:wrap; gap:4px; margin-top:8px; }
+  .yolo span { font-size:11px; padding:2px 7px; border-radius:4px; background:#10141a; border:1px solid var(--line); color:#c9d1d9; }
+  .yolo span.absent { border-style:dashed; color:var(--bad); }
+  .cap { margin-top:8px; font-size:12px; color:#c9d1d9; }
+  .cap summary { cursor:pointer; color:var(--muted); }
+  .cap p { margin:6px 0 0; white-space:pre-wrap; }
+  .nb { margin-top:8px; font-size:11px; color:var(--muted); border-top:1px dashed var(--line); padding-top:6px; }
+  .nb b { color:#c9d1d9; font-weight:600; }
+
+  .line { display:grid; grid-template-columns: 118px 1fr; gap:8px; margin:0 0 8px; font-size:13px; }
+  .line .who { font-weight:700; font-size:11px; letter-spacing:.6px; text-transform:uppercase; padding-top:2px; }
+  .pros .who { color:var(--pros); } .def .who { color:var(--def); } .judge .who { color:var(--judge); } .tape .who { color:var(--tape); } .finds .who { color:var(--warn); }
+  .line .what { color:#dfe3ea; }
+  .tape .what .q { color:var(--muted); font-style:italic; }
+  .obj { display:inline-block; font-size:11px; padding:1px 7px; border-radius:4px; border:1px solid var(--def); color:var(--def); margin-right:6px; vertical-align:1px; }
+  .stamp { position:absolute; top:10px; right:12px; font-size:12px; font-weight:800; letter-spacing:1.5px; padding:4px 10px; border:2px solid; border-radius:6px; transform:rotate(-4deg); text-transform:uppercase; }
+  .stamp.ADMIT { color:var(--ok); border-color:var(--ok); }
+  .stamp.STRIKE { color:var(--bad); border-color:var(--bad); }
+  .stamp.NOT_REACHED { color:var(--muted); border-color:var(--muted); }
+  .stamp .why { display:block; font-size:10px; font-weight:500; letter-spacing:.3px; text-transform:none; text-align:center; }
+
+  /* verdict */
+  #verdict { margin-top:18px; padding:16px; border-width:2px; }
+  #verdict .big { font-size:24px; font-weight:800; letter-spacing:.5px; }
+  #verdict .tally { display:flex; gap:18px; flex-wrap:wrap; margin:8px 0; font-size:13px; }
+  #verdict .tally b { font-size:18px; display:block; }
+  #verdict.guilty { border-color:var(--bad); } #verdict.dismissed { border-color:var(--ok); }
+  .bar { height:8px; background:#10141a; border-radius:4px; overflow:hidden; display:flex; margin:6px 0 10px; }
+  .bar i { display:block; height:100%; } .bar .a { background:var(--ok); } .bar .s { background:var(--bad); } .bar .n { background:#444b5a; }
+  details.tools { margin-top:28px; } details.tools summary { color:var(--muted); cursor:pointer; }
+  .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); gap:12px; margin-top:12px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:8px; }
+  .card p { margin:6px 0; font-size:12px; white-space:pre-wrap; }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>VSS Starter</h1>
+  <h1>Exhibit A <small>the video archive on trial</small></h1>
   <div id="check" class="muted">Checking services…</div>
-  <form id="f" style="margin-top:12px">
-    <input id="q" placeholder="Search the archive">
-    <button>Search</button>
+
+  <form id="claimform" class="panel">
+    <div class="row">
+      <input id="claim" placeholder="File a claim about the archive, e.g. “Trucks routinely block the bike lane on this route.”" autocomplete="off">
+      <select id="camera"><option value="">any camera</option></select>
+      <label class="small">exhibits <input id="k" type="number" min="1" max="30" value="8"></label>
+      <label class="small">subpoenas <input id="subpoenas" type="number" min="0" max="30" value="4"></label>
+      <button class="primary" id="file">File the claim</button>
+    </div>
+    <div class="row">
+      <span class="muted">Try:</span>
+      <div class="chips" id="chips"></div>
+    </div>
   </form>
-  <div id="status" class="muted"></div>
-  <div id="grid" class="grid"></div>
+
+  <div id="session"><span class="gavel idle"></span><span id="sessiontext" class="muted">Court is not in session.</span>
+    <span style="flex:1"></span><button id="dl" style="display:none">Download transcript</button></div>
+  <div id="exhibits"></div>
+  <div id="verdict" class="panel" style="display:none"></div>
+
+  <details class="tools">
+    <summary>Archive search (raw hits, no cross-examination)</summary>
+    <form id="f" style="margin-top:10px; display:flex; gap:8px">
+      <input id="q" placeholder="Search the archive" style="flex:1">
+      <button>Search</button>
+    </form>
+    <div id="status" class="muted"></div>
+    <div id="grid" class="grid"></div>
+  </details>
 </div>
+
 <script>
 // Ingress serves the app under /app and strips the prefix, so all calls are relative.
 const BASE = location.pathname.endsWith('/') ? location.pathname : location.pathname + '/';
+const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const clipUrl = id => `${BASE}api/clip?source=${encodeURIComponent(id)}`;
 
 async function post(path, body) {
-  const r = await fetch(BASE + path, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
+  const r = await fetch(BASE + path, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
   const d = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(d.detail || r.statusText);
   return d;
 }
 
+// ---- service check + cameras -------------------------------------------------------------
 fetch(BASE + 'api/check').then(r => r.json()).then(d => {
-  document.getElementById('check').innerHTML = Object.entries(d)
+  $('check').innerHTML = Object.entries(d)
     .map(([k, v]) => `${k}: <span class="${v.ok ? 'ok' : 'bad'}">${v.ok ? 'ok' : esc(v.error || v.status)}</span>`).join(' · ');
-}).catch(e => { document.getElementById('check').innerHTML = `<span class="bad">check failed: ${esc(e.message)}</span>`; });
+}).catch(e => { $('check').innerHTML = `<span class="bad">check failed: ${esc(e.message)}</span>`; });
 
-document.getElementById('f').addEventListener('submit', async e => {
+fetch(BASE + 'api/cameras').then(r => r.json()).then(d => {
+  for (const c of d.cameras || []) { const o = document.createElement('option'); o.value = o.textContent = c; $('camera').appendChild(o); }
+}).catch(() => {});
+
+const SAMPLES = [
+  ['Trucks routinely block the bike lane on this route.', 'nyc_bike_gopro-1'],
+  ['Someone was attacked with a forklift.', 'sdg_warehouse_cam-2'],
+  ['Pedestrians cross while cars are moving through the intersection.', ''],
+  ['A vehicle is stopped in the bike lane.', 'nyc_bike_gopro-1'],
+];
+for (const [c, cam] of SAMPLES) {
+  const el = document.createElement('span'); el.className = 'chip'; el.textContent = c;
+  el.onclick = () => { $('claim').value = c; $('camera').value = cam; $('claim').focus(); };
+  $('chips').appendChild(el);
+}
+
+// ---- courtroom ---------------------------------------------------------------------------
+const WHO = { PROSECUTION:'pros', DEFENSE:'def', JUDGE:'judge', 'THE COURT ASKS':'tape', 'THE TAPE ANSWERS':'tape', 'THE COURT FINDS':'finds', 'THE COURT':'finds' };
+let es = null, lines = [], rendered = new Set(), docket = 0, claimText = '';
+
+function line(who, html) {
+  return `<div class="line ${WHO[who] || ''}"><div class="who">${esc(who)}</div><div class="what">${html}</div></div>`;
+}
+
+function yoloChips(yolo, caption) {
+  const ks = Object.keys(yolo || {});
+  if (!ks.length) return '<span class="muted">no detections</span>';
+  return ks.sort((a, b) => yolo[b] - yolo[a]).map(k => `<span title="max per frame">${esc(k)} × ${yolo[k]}</span>`).join('');
+}
+
+function pendingCard(n) {
+  const el = document.createElement('div'); el.className = 'exhibit panel pending'; el.id = 'ex' + n;
+  el.innerHTML = `<div><h3>Exhibit ${n}</h3><div class="muted">on the docket</div></div><div class="right"></div>`;
+  return el;
+}
+
+function renderExhibit(r) {
+  const seg = r.segment, nb = r.neighbors || {};
+  const el = $('ex' + r.n) || pendingCard(r.n);
+  el.className = 'exhibit panel';
+  let right = line('PROSECUTION', esc(r.prosecution));
+  right += r.defense.objection === 'none'
+    ? line('DEFENSE', '<span class="muted">No objection.</span>')
+    : line('DEFENSE', `<span class="obj">objection · ${esc(r.defense.objection)}</span>${esc(r.defense.reason)}`);
+  right += line('JUDGE', esc(r.judge.line));
+  if (r.judge.ruling === 'SUBPOENA') {
+    if (r.subpoena) {
+      for (const a of r.subpoena.answers || []) {
+        right += line('THE COURT ASKS', `<span class="q">${esc(a.question)}</span>`);
+        right += line('THE TAPE ANSWERS', `<b>${esc(a.answer)}</b> — ${esc(a.reason)}`);
+      }
+      if ((r.subpoena.answers || []).length > 1 && r.subpoena.answer !== r.subpoena.answers[0].answer)
+        right += line('THE COURT FINDS', `<b>${esc(r.subpoena.answer)}</b> — the answers do not agree.`);
+    } else {
+      right += line('THE COURT', '<span class="muted">declines to view the tape: subpoena budget exhausted; exhibit not reached.</span>');
+    }
+  }
+  const why = r.disposition === 'STRIKE' ? (r.struck_for || '') : r.disposition === 'NOT_REACHED' ? 'not counted' : '';
+  const stampText = { ADMIT:'Admitted', STRIKE:'Struck', NOT_REACHED:'Not reached' }[r.disposition] || r.disposition;
+  const where = `${r.camera ? esc(r.camera) + ' · ' : ''}${esc(r.chunk)} @ ${Number(seg.ts)}s`;
+  const nbHtml = (nb.prev || nb.next) ? `<div class="nb">` +
+      (nb.prev ? `<div><b>−5s</b> ${esc((nb.prev.caption || '').slice(0, 110))}…</div>` : '') +
+      (nb.next ? `<div><b>+5s</b> ${esc((nb.next.caption || '').slice(0, 110))}…</div>` : '') + `</div>` : '';
+  el.innerHTML = `
+    <div>
+      <h3>Exhibit ${r.n}</h3>
+      <video controls preload="metadata" src="${clipUrl(seg.id)}"></video>
+      <div class="muted" style="margin-top:6px">${where}</div>
+      <div class="yolo">${yoloChips(seg.yolo, seg.caption)}</div>
+      <details class="cap"><summary>Caption (hearsay)</summary><p>${esc(seg.caption)}</p></details>
+      ${nbHtml}
+    </div>
+    <div class="right">${right}</div>
+    <div class="stamp ${r.disposition}">${stampText}${why ? `<span class="why">${esc(why)}</span>` : ''}</div>`;
+  if (!el.isConnected) $('exhibits').appendChild(el);
+}
+
+function renderVerdict(trial) {
+  const v = trial.verdict, total = v.admitted + v.struck + v.not_reached || 1;
+  const box = $('verdict');
+  box.style.display = '';
+  box.className = 'panel ' + (v.guilty ? 'guilty' : 'dismissed');
+  const why = Object.entries(v.struck_for || {}).filter(([, n]) => n).map(([k, n]) => `${n} ${k}`).join(' · ');
+  box.innerHTML = `
+    <div class="muted">VERDICT on “${esc(trial.claim)}”${trial.camera ? ' · ' + esc(trial.camera) : ''}</div>
+    <div class="big ${v.guilty ? 'bad' : 'ok'}">${v.guilty ? 'GUILTY' : 'NOT GUILTY — case dismissed'}</div>
+    <div class="bar"><i class="a" style="width:${100*v.admitted/total}%"></i><i class="s" style="width:${100*v.struck/total}%"></i><i class="n" style="width:${100*v.not_reached/total}%"></i></div>
+    <div class="tally">
+      <div><b class="ok">${v.admitted}</b>admitted</div>
+      <div><b class="bad">${v.struck}</b>struck${why ? ` <span class="muted">(${esc(why)})</span>` : ''}</div>
+      ${v.not_reached ? `<div><b class="muted">${v.not_reached}</b>not reached <span class="muted">(budget; not counted)</span></div>` : ''}
+      <div><b>${(v.confidence * 100).toFixed(0)}%</b>of decided exhibits admitted</div>
+      <div><b>${trial.subpoenas_used}/${trial.subpoenas}</b>subpoenas used</div>
+    </div>
+    ${line('BAILIFF', esc(v.bailiff))}
+    <div style="margin-top:6px"><b>SENTENCE:</b> ${v.guilty
+      ? `guilty — hazard report drafted${trial.report ? ` <span class="muted">(${esc(trial.report)})</span>` : ''}, listing ${v.admitted} admitted exhibit${v.admitted === 1 ? '' : 's'} with playback.`
+      : 'not guilty — case dismissed.'}</div>`;
+  box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function setSession(text, live) {
+  $('sessiontext').textContent = text;
+  document.querySelector('.gavel').className = 'gavel' + (live ? '' : ' idle');
+}
+
+function attach(id) {
+  if (es) es.close();
+  rendered = new Set(); lines = []; docket = 0;
+  $('exhibits').innerHTML = ''; $('verdict').style.display = 'none'; $('dl').style.display = 'none';
+  location.hash = 'trial=' + id;
+  setSession('Court is in session. The prosecution is gathering exhibits…', true);
+  es = new EventSource(`${BASE}api/trial/${id}/events`);
+  es.addEventListener('docket', e => {
+    docket = JSON.parse(e.data).exhibits;
+    if (!docket) { setSession('The prosecution found no exhibits for this claim on this camera.', false); return; }
+    for (let n = 1; n <= docket; n++) if (!$('ex' + n)) $('exhibits').appendChild(pendingCard(n));
+    setSession(`${docket} exhibits on the docket. The court is hearing exhibit 1…`, true);
+  });
+  es.addEventListener('exhibit', e => {
+    const d = JSON.parse(e.data); const r = d.record;
+    if (rendered.has(r.n)) return;           // EventSource reconnects replay history
+    rendered.add(r.n); lines.push(...(d.lines || []));
+    renderExhibit(r);
+    setSession(r.n < docket ? `${docket} exhibits on the docket. The court is hearing exhibit ${r.n + 1}…` : 'The court is deliberating…', true);
+  });
+  es.addEventListener('verdict', e => {
+    const d = JSON.parse(e.data); lines.push(...(d.lines || []));
+    renderVerdict(d.trial);
+    setSession('Court is adjourned.', false);
+    $('dl').style.display = '';
+  });
+  es.addEventListener('failed', e => { setSession('The court erred: ' + JSON.parse(e.data).error, false); });
+  es.addEventListener('done', () => { es.close(); es = null; $('file').disabled = false; });
+  es.onerror = () => { /* connection drop: EventSource retries; history is replayed and deduped */ };
+}
+
+$('claimform').addEventListener('submit', async e => {
   e.preventDefault();
-  const q = document.getElementById('q').value.trim();
+  claimText = $('claim').value.trim();
+  if (!claimText) { $('claim').focus(); return; }
+  $('file').disabled = true;
+  try {
+    const d = await post('api/trial', { claim: claimText, camera: $('camera').value || null,
+      k: +$('k').value || 8, subpoenas: +$('subpoenas').value || 0 });
+    attach(d.id);
+  } catch (err) { setSession('Could not file the claim: ' + err.message, false); $('file').disabled = false; }
+});
+
+$('dl').onclick = () => {
+  const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/plain' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'transcript.txt'; a.click();
+  URL.revokeObjectURL(a.href);
+};
+
+// Reload re-attaches to the trial in the URL hash; the server replays its history.
+const m = location.hash.match(/trial=([a-f0-9]+)/);
+if (m) { $('file').disabled = true; attach(m[1]); }
+
+// ---- raw archive search (kept from the starter) -----------------------------------------
+$('f').addEventListener('submit', async e => {
+  e.preventDefault();
+  const q = $('q').value.trim();
   if (!q) return;
-  const status = document.getElementById('status'), grid = document.getElementById('grid');
+  const status = $('status'), grid = $('grid');
   status.textContent = 'Searching…'; grid.innerHTML = '';
   try {
     const d = await post('api/search', { query: q });
@@ -60,7 +306,7 @@ document.getElementById('f').addEventListener('submit', async e => {
       const el = document.createElement('div');
       el.className = 'card';
       el.innerHTML = `
-        <video controls preload="metadata" src="${BASE}api/clip?source=${encodeURIComponent(r.source)}"></video>
+        <video controls preload="metadata" src="${clipUrl(r.source)}"></video>
         <div class="muted">${esc(r.filename)} · score ${(r.score ?? 0).toFixed(2)}</div>
         <p>${esc(r.caption.slice(0, 300))}</p>
         <button>Ask Cosmos</button>
