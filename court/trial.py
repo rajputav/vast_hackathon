@@ -31,25 +31,53 @@ PROSECUTOR = (
 )
 
 DEFENSE = (
-    "You are defense counsel. Captions are written by a vision-language model and are hearsay; object "
-    "detections and adjacent segments are physical evidence. Given the claim, the caption, the YOLO class "
-    "counts and bboxes for this segment, and the captions and YOLO counts of the previous and next segments, "
-    "decide whether to object. Object with type 'object' if the caption names an object class the detector "
-    "did not see or a different class is present (e.g. caption says truck, detector saw bus). Object with "
-    "type 'motion' if the caption says stopped/parked/blocking/stationary but bboxes change substantially "
-    "across segments, or says moving/passing but bboxes are stable. Object with type 'scope' if the caption "
-    "describes something real but not what the claim requires (wrong lane, wrong actor, wrong place). "
-    "Otherwise 'none'. Return only JSON: {\"objection\": \"none|object|motion|scope\", \"reason\": \"one "
-    "sentence citing the specific evidence\"}."
+    "You are defense counsel. Captions are written by a vision-language model and are hearsay; YOLO "
+    "detections and adjacent segments are physical evidence. Your duty is to object whenever this exhibit "
+    "does not prove the claim. 'none' is reserved for exhibits where the caption asserts every element of "
+    "the claim and the detections corroborate the classes it names. Agreeing that a truck is present is not "
+    "a defense.\n\n"
+    "Step 1 — break the claim into its required elements: the actor (an object class), the state or action "
+    "(stopped, parked, moving, crossing...), and the place (in the bike lane, in the crosswalk, at the dock...). "
+    "Frequency words in the claim (routinely, often, repeatedly, always) are NOT elements of a single exhibit; "
+    "the pattern is decided at verdict by counting admitted exhibits. Never object because one clip does not "
+    "show a pattern. Step 2 — check the caption against each element. Step 3 — check the caption's actor "
+    "against the detections.\n\n"
+    "How to read the evidence: 'yolo' is the maximum count per class seen in any frame of this 5-second "
+    "segment and is the authoritative detection record. 'bboxes' are boxes from one representative frame, so a "
+    "class present in 'yolo' but missing from 'bboxes' is NOT a contradiction. 'previous_segment' and "
+    "'next_segment' are the adjacent 5-second segments of the same video.\n\n"
+    "Objection types:\n"
+    "- 'object': the caption's actor class is absent from 'yolo', or 'yolo' shows a different class where the "
+    "actor should be (caption says truck, yolo saw only bus). Never object 'object' because bboxes omit a class "
+    "or because counts differ.\n"
+    "- 'motion': the caption says stopped/parked/stationary/blocking but the adjacent segments show the actor "
+    "moving or gone; or the caption says moving/passing while the adjacent segments describe it stopped in the "
+    "same place.\n"
+    "- 'scope': the caption describes something real but does not assert every element of the claim — wrong "
+    "actor class, wrong state (passing by or driving in traffic is not blocking), or wrong place (a truck in a "
+    "traffic lane, at the curb, or 'on the street' is not in the bike lane unless the caption says so). A caption "
+    "that never mentions the place or state the claim requires is 'scope', not 'none'. In the reason, say "
+    "which it is: 'state never asserted' (the caption describes no blocking/stopping at all) or 'place unstated' "
+    "(the caption asserts the actor and state but names only 'the lane', 'the road' or no place). The judge "
+    "strikes the first outright and may view the tape for the second.\n"
+    "- 'none': every element is asserted by the caption and the actor is corroborated by 'yolo'.\n\n"
+    "Return only JSON: {\"objection\": \"none|object|motion|scope\", \"reason\": \"one sentence naming the "
+    "missing or contradicted element and the specific evidence\"}."
 )
 
 JUDGE = (
     "You are the judge. You rule on one exhibit given the claim, the caption, the detections, and the "
-    "defense's objection. ADMIT only if the detections corroborate the caption on the point the claim needs "
-    "and no valid objection stands. STRIKE if the objection is supported by the evidence. SUBPOENA if the "
-    "caption and detections cannot settle it — write one yes/no question that a model watching the clip "
-    "could answer to decide the point. Return only JSON: {\"ruling\": \"ADMIT|STRIKE|SUBPOENA\", "
-    "\"question\": \"...\", \"line\": \"one dry, formal, slightly theatrical sentence announcing the ruling\"}."
+    "defense's objection. ADMIT only if the caption asserts what the claim requires, the detections corroborate "
+    "it, and no valid objection stands. Overrule and ADMIT when the objection is contradicted by the record "
+    "(an 'object' objection where 'yolo' contains the class; a 'scope' objection where the caption plainly "
+    "asserts the element; any objection that one clip does not prove a pattern — frequency words like "
+    "'routinely' are decided at verdict, not per exhibit). STRIKE when the objection is supported by the record: "
+    "the caption never asserts the required state or action at all, or the detections contradict the actor. "
+    "Subpoenas are scarce: SUBPOENA only when the caption asserts the actor AND the state and the sole open "
+    "question is the place — for example the caption says 'parked, partially blocking the lane' and the question "
+    "is whether that lane is the bike lane — and write one yes/no question that a model watching the clip could "
+    "answer to decide it. Return only JSON: {\"ruling\": \"ADMIT|STRIKE|SUBPOENA\", \"question\": \"...\", "
+    "\"line\": \"one dry, formal, slightly theatrical sentence announcing the ruling\"}."
 )
 
 BAILIFF = (
@@ -81,7 +109,11 @@ LOOK_TO_RULING = {"yes": "ADMIT", "no": "STRIKE", "unclear": "STRIKE"}
 def _neighbor_view(segment: dict | None) -> dict | None:
     if segment is None:
         return None
-    return {"caption": segment.get("caption", ""), "yolo": segment.get("yolo", {})}
+    return {
+        "caption": segment.get("caption", ""),
+        "yolo": segment.get("yolo", {}),
+        "bboxes": segment.get("bboxes", []),
+    }
 
 
 def _clean(text: str) -> str:
