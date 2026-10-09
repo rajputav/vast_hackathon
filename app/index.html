@@ -45,7 +45,9 @@
   .exhibit > div { min-width:0; }
   .exhibit .where { overflow-wrap:anywhere; }
   /* keep the stamp and overturn badge clear of the transcript */
-  @media (min-width: 761px) { .exhibit .right { padding-right:200px; } }
+  /* the ruling sits in its own row above the transcript, so it can never cover it */
+  .ruling { display:flex; flex-wrap:wrap; align-items:center; justify-content:flex-end; gap:8px; margin:0 0 10px; }
+  .ruling .stamp, .ruling .overturn { position:static; }
   .exhibit h3 { margin:0 0 6px; font-size:13px; color:var(--muted); font-weight:600; letter-spacing:.4px; text-transform:uppercase; }
   video { width:100%; aspect-ratio:16/9; background:#000; border-radius:6px; }
   .yolo { display:flex; flex-wrap:wrap; gap:4px; margin-top:8px; }
@@ -342,9 +344,13 @@ function renderExhibit(r) {
       <details class="cap"><summary>Caption (hearsay)</summary><p>${esc(seg.caption)}</p></details>
       ${nbHtml}
     </div>
-    <div class="right">${right}</div>
-    <div class="stamp ${r.disposition}">${stampText}${why ? `<span class="why">${esc(why)}</span>` : ''}</div>
-    ${over ? `<div class="overturn" title="the judge ruled ${esc(r.judge.ruling.toLowerCase())} on the caption and detections; the tape decided otherwise">⚡ tape overturned the papers</div>` : ''}`;
+    <div class="right">
+      <div class="ruling">
+        ${over ? `<div class="overturn" title="the judge ruled ${esc(r.judge.ruling.toLowerCase())} on the caption and detections; the tape decided otherwise">⚡ tape overturned the papers</div>` : ''}
+        <div class="stamp ${r.disposition}">${stampText}${why ? `<span class="why">${esc(why)}</span>` : ''}</div>
+      </div>
+      ${right}
+    </div>`;
   if (!el.isConnected) $('exhibits').appendChild(el);
   markTile(r);
 }
