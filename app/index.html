@@ -121,7 +121,8 @@
   #verdict .big { animation:gavel .6s cubic-bezier(.2,1.8,.4,1) both; transform-origin:left center; }
   @keyframes gavel { 0% { opacity:0; transform:scale(1.8); letter-spacing:8px; } 100% { opacity:1; transform:scale(1); } }
   .reel { display:grid; grid-template-columns:repeat(auto-fill, minmax(min(100%, 220px), 1fr)); gap:8px; margin-top:12px; }
-  .reel figure { margin:0; } .reel figcaption { font-size:11px; color:var(--muted); margin-top:3px; }
+  .reel figure { margin:0; min-width:0; }
+  .reel figcaption { font-size:11px; color:var(--muted); margin-top:3px; overflow-wrap:anywhere; }
   .reel video { border:2px solid var(--bad); }
 </style>
 </head>
@@ -382,12 +383,19 @@ function renderVerdict(trial) {
   box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
+// Synthetic warehouse chunks are named '<hash>_<hash>_run_7_seed_900334964.eye_00.rgb_chunk_0000';
+// the reel only has room for the part a person reads: 'run_7 · eye_00'.
+function shortChunk(chunk) {
+  const m = String(chunk).match(/(run_\d+)_seed_\d+\.([a-z]+_\d+)/);
+  return m ? `${m[1]} · ${m[2]}` : String(chunk);
+}
+
 function reel(trial) {
   const admitted = (trial.exhibits || []).filter(r => r.disposition === 'ADMIT').slice(0, 8);
   if (!admitted.length) return '';
   return `<div class="muted" style="margin-top:14px">THE EVIDENCE — what the tape showed</div><div class="reel">` +
     admitted.map(r => `<figure><video src="${clipUrl(r.segment.id)}" muted autoplay loop playsinline preload="auto"></video>
-      <figcaption>Exhibit ${r.n} · ${esc(r.chunk)} @ ${Number(r.segment.ts)}s<br>${esc((r.subpoena && r.subpoena.reason) || '')}</figcaption></figure>`).join('') +
+      <figcaption title="${esc(r.chunk)}">Exhibit ${r.n} · ${esc(shortChunk(r.chunk))} @ ${Number(r.segment.ts)}s<br>${esc((r.subpoena && r.subpoena.reason) || '')}</figcaption></figure>`).join('') +
     `</div>`;
 }
 
