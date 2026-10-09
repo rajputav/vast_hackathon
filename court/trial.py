@@ -1,6 +1,10 @@
 """Court trial — put a claim about the archive on trial, one exhibit at a time.
 
-    python -m court.trial --claim "..." --camera nyc_bike_gopro-1 --k 10 --subpoenas 4 --out transcript.txt
+    python -m court.trial --claim "..." --camera nyc_bike_gopro-1 --k 10 --subpoenas 4 \
+        --out transcript.txt --json trial.json
+
+Every exhibit becomes one record (see ``try_exhibit``) that the transcript, the ledger, the
+hazard report and ``--json`` all render; UIs should consume the record, not the prose.
 """
 
 from __future__ import annotations
@@ -172,61 +176,140 @@ def rule(claim: str, segment: dict, objection: dict) -> dict:
     return {"ruling": ruling, "question": question, "line": _clean(result.get("line", ""))}
 
 
+# ---------------------------------------------------------------------------
+# Per-exhibit record — the one object the transcript, ledger, report and UI all render.
+# ---------------------------------------------------------------------------
+
+# Why an exhibit ended up struck. "budget" is a court-capacity failure, not an evidence failure.
+STRUCK_FOR = ("objection", "tape", "unclear", "budget")
+
+
+def _public_segment(segment: dict) -> dict:
+    """The search() contract dict minus playback_url, which embeds the VSS JWT.
+
+    UIs should play ``id`` through their own proxy (the app has ``/api/clip?source=``).
+    """
+    return {k: v for k, v in segment.items() if k != "playback_url"}
+
+
+def _neighbor_record(segment: dict | None) -> dict | None:
+    if segment is None:
+        return None
+    return {
+        "id": segment.get("id"),
+        "ts": segment.get("ts"),
+        "caption": segment.get("caption", ""),
+        "yolo": segment.get("yolo", {}),
+    }
+
+
+def try_exhibit(claim: str, n: int, segment: dict, camera: str | None, budget: int) -> tuple[dict, int]:
+    """Run one exhibit through prosecution, defense, judge and (maybe) the tape.
+
+    Returns the exhibit record and the remaining subpoena budget.
+    """
+    prev, nxt = neighbors(segment["id"])
+    prosecution = prosecute(claim, segment)
+    defense = defend(claim, segment, prev, nxt)
+    judge = rule(claim, segment, defense)
+
+    subpoena: dict | None = None
+    disposition = judge["ruling"]
+    struck_for: str | None = None
+    if disposition == "SUBPOENA":
+        if budget > 0:
+            budget -= 1
+            t0 = time.monotonic()
+            viewed = look(segment["id"], judge["question"])
+            answer = str(viewed.get("answer", "unclear")).lower()
+            if answer not in LOOK_TO_RULING:
+                answer = "unclear"
+            subpoena = {
+                "question": judge["question"],
+                "answer": answer,
+                "reason": _clean(viewed.get("reason", "")),
+                "seconds": round(time.monotonic() - t0, 2),
+            }
+            disposition = LOOK_TO_RULING[answer]
+            if disposition == "STRIKE":
+                struck_for = "unclear" if answer == "unclear" else "tape"
+        else:
+            disposition = "STRIKE"
+            struck_for = "budget"
+    elif disposition == "STRIKE":
+        struck_for = "objection"
+
+    record = {
+        "n": n,
+        "camera": camera,
+        "chunk": _chunk_name(segment),
+        "segment": _public_segment(segment),
+        "neighbors": {"prev": _neighbor_record(prev), "next": _neighbor_record(nxt)},
+        "prosecution": prosecution,
+        "defense": defense,
+        "judge": judge,
+        "subpoena": subpoena,
+        "disposition": disposition,
+        "struck_for": struck_for,
+    }
+    return record, budget
+
+
+def exhibit_lines(record: dict) -> list[str]:
+    """Transcript lines for one exhibit record."""
+    seg = record["segment"]
+    # ts is relative to the parent chunk, so the chunk name is what tells exhibits apart.
+    where = f"{record['camera']} · {record['chunk']}" if record["camera"] else record["chunk"]
+    lines = [
+        f"EXHIBIT {record['n']}  [{where} @ {seg['ts']:g}s]",
+        f"  PROSECUTION: {record['prosecution']}",
+    ]
+    defense = record["defense"]
+    if defense["objection"] == "none":
+        lines.append("  DEFENSE:     No objection.")
+    else:
+        lines.append(f"  DEFENSE:     Objection ({defense['objection']}). {defense['reason']}")
+    lines.append(f"  JUDGE:       {record['judge']['line']}")
+    if record["judge"]["ruling"] == "SUBPOENA":
+        if record["subpoena"]:
+            sub = record["subpoena"]
+            lines.append(f"  THE COURT ASKS: {sub['question']}")
+            lines.append(f"  THE COURT VIEWS THE TAPE: {sub['answer']} — {sub['reason']}")
+        else:
+            lines.append("  THE COURT DECLINES TO VIEW THE TAPE: subpoena budget exhausted; exhibit struck.")
+    lines.append("")
+    return lines
+
+
+def _strike_breakdown(records: list[dict]) -> dict[str, int]:
+    counts = {reason: 0 for reason in STRUCK_FOR}
+    for r in records:
+        if r["disposition"] == "STRIKE" and r["struck_for"] in counts:
+            counts[r["struck_for"]] += 1
+    return counts
+
+
 def run_trial(claim: str, camera: str | None, k: int, subpoenas: int) -> tuple[list[str], dict]:
+    """Try every exhibit search() returns.
+
+    Returns ``(transcript_lines, trial)`` where ``trial`` carries the per-exhibit records
+    under ``exhibits`` plus the verdict, so UIs render the same object the transcript does.
+    """
     lines: list[str] = []
+    records: list[dict] = []
     budget = subpoenas
-    admitted: list[dict] = []
-    struck = 0
 
-    exhibits = search(claim, camera=camera, k=k)
-    for n, segment in enumerate(exhibits, start=1):
-        prev, nxt = neighbors(segment["id"])
-        # ts is relative to the parent chunk, so the chunk name is what tells exhibits apart.
-        where = f"{camera} · {_chunk_name(segment)}" if camera else _chunk_name(segment)
-        lines.append(f"EXHIBIT {n}  [{where} @ {segment['ts']:g}s]")
-        lines.append(f"  PROSECUTION: {prosecute(claim, segment)}")
-
-        objection = defend(claim, segment, prev, nxt)
-        if objection["objection"] == "none":
-            lines.append("  DEFENSE:     No objection.")
-        else:
-            lines.append(f"  DEFENSE:     Objection ({objection['objection']}). {objection['reason']}")
-
-        decision = rule(claim, segment, objection)
-        lines.append(f"  JUDGE:       {decision['line']}")
-
-        ruling = decision["ruling"]
-        subpoenaed = False
-        if ruling == "SUBPOENA":
-            if budget > 0:
-                budget -= 1
-                subpoenaed = True
-                viewed = look(segment["id"], decision["question"])
-                answer = str(viewed.get("answer", "unclear")).lower()
-                ruling = LOOK_TO_RULING.get(answer, "STRIKE")
-                lines.append(f"  THE COURT VIEWS THE TAPE: {_clean(viewed.get('reason', ''))}")
-            else:
-                ruling = "STRIKE"
-                lines.append("  THE COURT DECLINES TO VIEW THE TAPE: subpoena budget exhausted; exhibit struck.")
-
-        if ruling == "ADMIT":
-            admitted.append(segment)
-        else:
-            struck += 1
-
+    for n, segment in enumerate(search(claim, camera=camera, k=k), start=1):
+        record, budget = try_exhibit(claim, n, segment, camera, budget)
+        records.append(record)
+        lines.extend(exhibit_lines(record))
         with LEDGER.open("a") as f:
-            f.write(json.dumps({
-                "claim": claim,
-                "segment_id": segment["id"],
-                "ruling": ruling,
-                "objection": objection["objection"],
-                "reason": objection["reason"],
-                "subpoenaed": subpoenaed,
-                "ts": segment["ts"],
-            }) + "\n")
-        lines.append("")
+            f.write(json.dumps({"claim": claim, **record}) + "\n")
 
-    total = len(admitted) + struck
+    admitted = [r for r in records if r["disposition"] == "ADMIT"]
+    struck = len(records) - len(admitted)
+    breakdown = _strike_breakdown(records)
+    total = len(records)
     confidence = len(admitted) / total if total else 0.0
     guilty = bool(total) and confidence >= 0.5
     # The outcome is decided here, not by the bailiff; without it the model can announce
@@ -240,33 +323,72 @@ def run_trial(claim: str, camera: str | None, k: int, subpoenas: int) -> tuple[l
         model=REASONING_MODEL,
     ))
     lines.append(f"VERDICT  [admitted {len(admitted)} · struck {struck} · confidence {confidence:.2f}]")
+    if struck:
+        why = " · ".join(f"{v} {k}" for k, v in breakdown.items() if v)
+        lines.append(f"  STRUCK FOR:  {why}")
     lines.append(f"  BAILIFF:     {bailiff}")
 
+    trial = {
+        "claim": claim,
+        "camera": camera,
+        "k": k,
+        "subpoenas": subpoenas,
+        "subpoenas_used": subpoenas - budget,
+        "exhibits": records,
+        "verdict": {
+            "admitted": len(admitted),
+            "struck": struck,
+            "struck_for": breakdown,
+            "confidence": confidence,
+            "guilty": guilty,
+            "bailiff": bailiff,
+        },
+        "report": None,
+    }
     if guilty:
-        report = write_report(claim, camera, admitted, struck, confidence)
-        lines.append(f"SENTENCE: guilty — hazard report drafted to {report}")
+        trial["report"] = write_report(trial)
+        lines.append(f"SENTENCE: guilty — hazard report drafted to {trial['report']}")
     else:
         lines.append("SENTENCE: not guilty — case dismissed")
-
-    summary = {"admitted": len(admitted), "struck": struck, "confidence": confidence}
-    return lines, summary
+    return lines, trial
 
 
-def write_report(claim: str, camera: str | None, admitted: list[dict], struck: int, confidence: float) -> str:
+def write_report(trial: dict) -> str:
+    """Hazard report from the trial record: admitted exhibits, then what was struck and why."""
     stamp = time.strftime("%Y%m%d_%H%M%S")
     path = COURT_DIR / f"report_{stamp}.md"
-    rows = "\n".join(
-        f"| {seg['id']} | {seg['ts']} | {seg['caption']} | {seg.get('playback_url', '')} |"
-        for seg in admitted
-    )
+    v = trial["verdict"]
+    admitted = [r for r in trial["exhibits"] if r["disposition"] == "ADMIT"]
+    struck = [r for r in trial["exhibits"] if r["disposition"] != "ADMIT"]
+
+    def row(r: dict) -> str:
+        seg = r["segment"]
+        return f"| {r['n']} | {r['chunk']} | {seg['ts']:g}s | {seg['id']} | {seg['caption']} |"
+
+    def struck_row(r: dict) -> str:
+        seg = r["segment"]
+        why = r["struck_for"] or ""
+        if r["struck_for"] == "objection":
+            why = f"objection ({r['defense']['objection']}): {r['defense']['reason']}"
+        elif r["subpoena"]:
+            why = f"tape ({r['subpoena']['answer']}): {r['subpoena']['reason']}"
+        elif r["struck_for"] == "budget":
+            why = "not viewed: subpoena budget exhausted"
+        return f"| {r['n']} | {r['chunk']} | {seg['ts']:g}s | {why} |"
+
     path.write_text(
         f"# Hazard report\n\n"
-        f"**Claim:** {claim}  \n"
-        f"**Camera:** {camera or 'all'}  \n"
-        f"**Verdict:** guilty — {len(admitted)} admitted, {struck} struck, confidence {confidence:.2f}  \n"
+        f"**Claim:** {trial['claim']}  \n"
+        f"**Camera:** {trial['camera'] or 'all'}  \n"
+        f"**Verdict:** guilty — {v['admitted']} admitted, {v['struck']} struck, confidence {v['confidence']:.2f}  \n"
         f"**Filed:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         f"## Admitted exhibits\n\n"
-        f"| Segment | ts | Caption | Playback |\n|---|---|---|---|\n{rows}\n"
+        f"| # | Chunk | ts | Segment | Caption |\n|---|---|---|---|---|\n"
+        + "\n".join(row(r) for r in admitted)
+        + "\n\n## Struck exhibits\n\n"
+        f"| # | Chunk | ts | Struck for |\n|---|---|---|---|\n"
+        + ("\n".join(struck_row(r) for r in struck) or "| – | – | – | none |")
+        + "\n"
     )
     return str(path.relative_to(COURT_DIR.parent))
 
@@ -278,13 +400,16 @@ def main() -> None:
     parser.add_argument("--k", type=int, default=10, help="number of exhibits to search for")
     parser.add_argument("--subpoenas", type=int, default=4, help="max clips the court may view")
     parser.add_argument("--out", default=None, help="also write the transcript here")
+    parser.add_argument("--json", default=None, help="write the full trial record (per-exhibit dicts + verdict) here")
     args = parser.parse_args()
 
-    lines, _ = run_trial(args.claim, args.camera, args.k, args.subpoenas)
+    lines, trial = run_trial(args.claim, args.camera, args.k, args.subpoenas)
     transcript = "\n".join(lines)
     print(transcript)
     if args.out:
         Path(args.out).write_text(transcript + "\n")
+    if args.json:
+        Path(args.json).write_text(json.dumps(trial, indent=2) + "\n")
 
 
 if __name__ == "__main__":
