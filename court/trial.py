@@ -4,7 +4,7 @@
         --out transcript.txt --json trial.json
 
 Nothing is admitted on the papers: every exhibit's tape is viewed (unless --subpoenas caps it),
-and only the tape can admit. A tape that shows the claimed conduct can be struck only on scope.
+and only the tape can admit — the court asks it the claim itself, plus the judge's question and foundation.
 
 Every exhibit becomes one record (see ``try_exhibit``) that the transcript, the ledger, the
 hazard report and ``--json`` all render; UIs should consume the record, not the prose.
@@ -108,7 +108,8 @@ JUDGE = (
     "'routinely' are decided at verdict, not per exhibit). STRIKE when the objection is supported by the record: "
     "the caption never asserts the required state or action at all, or the detections contradict the actor. "
     "SUBPOENA when the papers cannot settle it either way.\n\n"
-    "Whatever your ruling, always write two yes/no questions for a model that sees only the pixels of a 5-second clip "
+    "Whatever your ruling, always write two yes/no questions (the court also puts the claim itself to the tape; "
+    "every answer must be yes) for a model that sees only the pixels of a 5-second clip "
     "(it has not read the caption or the claim). 'question' decides the open element: it must ask whether the "
     "claim's action or state itself happens in the clip (e.g. 'Does the forklift make physical contact with a "
     "person?', 'Is a motor vehicle stopped inside the painted bike lane?') — never merely whether an object or "
@@ -146,6 +147,17 @@ JUDGE_SCHEMA = {
 }
 
 LOOK_TO_RULING = {"yes": "ADMIT", "no": "STRIKE", "unclear": "STRIKE"}
+
+# The deciding question is the court's, not the judge's: left to write it, the judge asked whatever
+# settled the objection ("Is a forklift visible?") and a forklift merely being present convicted.
+CLAIM_QUESTION = (
+    "Does this clip itself show an instance of the following: {claim}? "
+    "Judge only what is visible, not what is typical."
+)
+
+
+def claim_question(claim: str) -> str:
+    return CLAIM_QUESTION.format(claim=claim.strip().rstrip(".?!"))
 
 # A claim with a frequency word alleges a pattern: guilty only if most decided exhibits are admitted.
 # Without one it alleges an incident ("a forklift hits a person"): one admitted exhibit proves it,
@@ -299,8 +311,8 @@ def rule(claim: str, segment: dict, objection: dict) -> dict:
     }
 
 
-def view_tape(segment_id: str, question: str, foundation: str) -> dict:
-    """Put the judge's questions to the clip; both must be answered yes to admit.
+def view_tape(segment_id: str, *questions: str) -> dict:
+    """Put the court's questions to the clip; every one must be answered yes to admit.
 
     Two independent framings have to agree before one 5-second clip decides an exhibit —
     a single leading question ("is the truck in the bike lane?") was being answered yes on
@@ -308,7 +320,7 @@ def view_tape(segment_id: str, question: str, foundation: str) -> dict:
     """
     t0 = time.monotonic()
     answers: list[dict] = []
-    for q in (question, foundation):
+    for q in questions:
         if not q:
             continue
         viewed = look(segment_id, q)
@@ -325,7 +337,7 @@ def view_tape(segment_id: str, question: str, foundation: str) -> dict:
         verdict = "no"
     else:  # unclear, or no questions at all
         verdict = "unclear"
-    main = answers[0] if answers else {"question": question, "answer": "unclear", "reason": "no question"}
+    main = answers[0] if answers else {"question": "", "answer": "unclear", "reason": "no question"}
     return {
         "question": main["question"],
         "answer": verdict,
@@ -371,27 +383,28 @@ def try_exhibit(claim: str, n: int, segment: dict, camera: str | None, may_view:
     """Run one exhibit through prosecution, defense, the judge on the papers, then the tape.
 
     The papers alone can strike but never admit. When ``may_view`` the tape is always viewed and
-    decides: yes admits (unless the defense showed the exhibit is out of scope), no or unclear strikes.
-    A caption or detector disagreeing with the tape doesn't outrank it — the detector can't even see
-    a forklift. Without ``may_view`` an exhibit the papers didn't strike is NOT_REACHED.
+    decides: the court asks it the claim itself plus the judge's question and foundation; all yes
+    admits, any no or unclear strikes. Objections argue from the caption and detector, and the tape outranks
+    both — the detector can't even see a forklift, and a caption that leaves out the collision is
+    exactly what the tape is for. Without ``may_view`` an exhibit the papers didn't strike is
+    NOT_REACHED.
     """
     prev, nxt = neighbors(segment["id"])
     prosecution = prosecute(claim, segment)
     defense = defend(claim, segment, prev, nxt)
     judge = rule(claim, segment, defense)
 
-    subpoena = view_tape(segment["id"], judge["question"], judge["foundation"]) if may_view else None
-    struck_on_scope = judge["ruling"] == "STRIKE" and defense["objection"] == "scope"
+    subpoena = (
+        view_tape(segment["id"], claim_question(claim), judge["question"], judge["foundation"]) if may_view else None
+    )
     struck_for: str | None = None
     if subpoena is None:
         disposition = "STRIKE" if judge["ruling"] == "STRIKE" else "NOT_REACHED"
         struck_for = "objection" if disposition == "STRIKE" else None
-    elif subpoena["answer"] == "yes":
-        disposition = "STRIKE" if struck_on_scope else "ADMIT"
-        struck_for = "objection" if struck_on_scope else None
     else:
-        disposition = "STRIKE"
-        struck_for = "unclear" if subpoena["answer"] == "unclear" else "tape"
+        disposition = LOOK_TO_RULING[subpoena["answer"]]
+        if disposition == "STRIKE":
+            struck_for = "unclear" if subpoena["answer"] == "unclear" else "tape"
 
     # The tape witness is the Cosmos endpoint; the caption came from a Cosmos model too. When they
     # are the same model, the tape agreeing with the caption is the same witness twice, not

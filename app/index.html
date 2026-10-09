@@ -29,6 +29,7 @@
   .chip:hover { color:var(--fg); border-color:#3a4150; }
   label.small { font-size:12px; color:var(--muted); display:flex; align-items:center; gap:6px; }
   label.small input { width:64px; }
+  label.small input[type=checkbox] { width:auto; }
 
   /* session line */
   #session { margin:16px 0 8px; display:flex; align-items:center; gap:10px; min-height:22px; }
@@ -41,6 +42,10 @@
   @media (max-width: 760px) { .exhibit { grid-template-columns: 1fr; } }
   .exhibit.pending { opacity:.45; }
   .exhibit.pending .right::after { content:'awaiting the court…'; color:var(--muted); font-style:italic; font-size:12px; }
+  .exhibit > div { min-width:0; }
+  .exhibit .where { overflow-wrap:anywhere; }
+  /* keep the stamp and overturn badge clear of the transcript */
+  @media (min-width: 761px) { .exhibit .right { padding-right:200px; } }
   .exhibit h3 { margin:0 0 6px; font-size:13px; color:var(--muted); font-weight:600; letter-spacing:.4px; text-transform:uppercase; }
   video { width:100%; aspect-ratio:16/9; background:#000; border-radius:6px; }
   .yolo { display:flex; flex-wrap:wrap; gap:4px; margin-top:8px; }
@@ -53,7 +58,7 @@
   .nb { margin-top:8px; font-size:11px; color:var(--muted); border-top:1px dashed var(--line); padding-top:6px; }
   .nb b { color:#c9d1d9; font-weight:600; }
 
-  .line { display:grid; grid-template-columns: 118px 1fr; gap:8px; margin:0 0 8px; font-size:13px; }
+  .line { display:grid; grid-template-columns: 132px 1fr; gap:8px; margin:0 0 8px; font-size:13px; }
   .line .who { font-weight:700; font-size:11px; letter-spacing:.6px; text-transform:uppercase; padding-top:2px; }
   .pros .who { color:var(--pros); } .def .who { color:var(--def); } .judge .who { color:var(--judge); } .tape .who { color:var(--tape); } .finds .who { color:var(--warn); }
   .line .what { color:#dfe3ea; }
@@ -77,6 +82,45 @@
   .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); gap:12px; margin-top:12px; }
   .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:8px; }
   .card p { margin:6px 0; font-size:12px; white-space:pre-wrap; }
+
+  /* docket board: one tile per exhibit, lit as the court rules */
+  #board { display:none; margin:6px 0 4px; padding:12px 14px; }
+  #board .top { display:flex; flex-wrap:wrap; align-items:baseline; gap:18px; margin-bottom:10px; }
+  #board .score b { font-size:22px; font-weight:800; display:block; line-height:1.1; font-variant-numeric:tabular-nums; }
+  #board .score { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.6px; }
+  #board .score.over b { color:var(--warn); }
+  #tiles { display:flex; flex-wrap:wrap; gap:4px; }
+  .tile { width:22px; height:22px; border-radius:4px; background:#232833; border:1px solid var(--line); cursor:pointer;
+          font-size:10px; color:#0b0d10; display:flex; align-items:center; justify-content:center; font-weight:800; transition:transform .15s; }
+  .tile:hover { transform:scale(1.25); }
+  .tile.pending { animation:breathe 1.6s ease-in-out infinite; }
+  @keyframes breathe { 50% { background:#2f3644; } }
+  .tile.ADMIT { background:var(--ok); border-color:var(--ok); animation:pop .35s ease-out; }
+  .tile.STRIKE { background:var(--bad); border-color:var(--bad); animation:pop .35s ease-out; }
+  .tile.NOT_REACHED { background:#444b5a; }
+  .tile.over { box-shadow:0 0 0 2px var(--warn); }
+  @keyframes pop { 0% { transform:scale(.4); } 70% { transform:scale(1.3); } 100% { transform:scale(1); } }
+  .filters { display:flex; gap:6px; margin-left:auto; }
+  .filters button { font-size:12px; padding:4px 10px; }
+  .filters button.on { background:#2b3b55; border-color:#3a5281; }
+  #exhibits.f-ADMIT .exhibit:not(.d-ADMIT), #exhibits.f-STRIKE .exhibit:not(.d-STRIKE),
+  #exhibits.f-over .exhibit:not(.over) { display:none; }
+
+  /* rulings land like a rubber stamp; overturned exhibits say so */
+  .stamp { animation:slam .45s cubic-bezier(.2,1.6,.4,1) both; }
+  @keyframes slam { 0% { opacity:0; transform:rotate(-4deg) scale(2.6); } 100% { opacity:1; transform:rotate(-4deg) scale(1); } }
+  .overturn { position:absolute; top:44px; right:12px; font-size:10px; font-weight:800; letter-spacing:1px; color:var(--warn);
+              border:1px dashed var(--warn); border-radius:4px; padding:2px 6px; text-transform:uppercase; }
+  .exhibit.over { border-color:rgba(210,153,34,.55); }
+  .exhibit.flash { animation:flash 1.2s ease-out; }
+  @keyframes flash { 0% { box-shadow:0 0 0 3px var(--warn); } 100% { box-shadow:0 0 0 0 transparent; } }
+
+  /* verdict reveal + evidence reel */
+  #verdict .big { animation:gavel .6s cubic-bezier(.2,1.8,.4,1) both; transform-origin:left center; }
+  @keyframes gavel { 0% { opacity:0; transform:scale(1.8); letter-spacing:8px; } 100% { opacity:1; transform:scale(1); } }
+  .reel { display:grid; grid-template-columns:repeat(auto-fill, minmax(min(100%, 220px), 1fr)); gap:8px; margin-top:12px; }
+  .reel figure { margin:0; } .reel figcaption { font-size:11px; color:var(--muted); margin-top:3px; }
+  .reel video { border:2px solid var(--bad); }
 </style>
 </head>
 <body>
@@ -101,6 +145,21 @@
 
   <div id="session"><span class="gavel idle"></span><span id="sessiontext" class="muted">Court is not in session.</span>
     <span style="flex:1"></span><button id="dl" style="display:none">Download transcript</button></div>
+  <div id="board" class="panel">
+    <div class="top">
+      <div class="score"><b class="ok" id="sc-admit">0</b>admitted</div>
+      <div class="score"><b class="bad" id="sc-strike">0</b>struck</div>
+      <div class="score"><b id="sc-pending">0</b>awaiting the court</div>
+      <div class="score over" title="exhibits where the tape reversed the ruling the judge made on the caption and detections alone"><b id="sc-over">0</b>tape overturned the papers</div>
+      <div class="filters">
+        <button type="button" data-f="" class="on">all</button>
+        <button type="button" data-f="ADMIT">admitted</button>
+        <button type="button" data-f="STRIKE">struck</button>
+        <button type="button" data-f="over">overturned</button>
+      </div>
+    </div>
+    <div id="tiles"></div>
+  </div>
   <div id="exhibits"></div>
   <div id="verdict" class="panel" style="display:none"></div>
 
@@ -141,13 +200,14 @@ fetch(BASE + 'api/cameras').then(r => r.json()).then(d => {
 
 const SAMPLES = [
   ['Trucks routinely block the bike lane on this route.', 'nyc_bike_gopro-1'],
+  ['A forklift hits a person.', 'sdg_warehouse_cam-2', true],
   ['Someone was attacked with a forklift.', 'sdg_warehouse_cam-2'],
   ['Pedestrians cross while cars are moving through the intersection.', ''],
   ['A vehicle is stopped in the bike lane.', 'nyc_bike_gopro-1'],
 ];
-for (const [c, cam] of SAMPLES) {
-  const el = document.createElement('span'); el.className = 'chip'; el.textContent = c;
-  el.onclick = () => { $('claim').value = c; $('camera').value = cam; $('claim').focus(); };
+for (const [c, cam, whole] of SAMPLES) {
+  const el = document.createElement('span'); el.className = 'chip'; el.textContent = c + (whole ? ' (every clip)' : '');
+  el.onclick = () => { $('claim').value = c; $('camera').value = cam; $('whole').checked = !!whole; $('claim').focus(); };
   $('chips').appendChild(el);
 }
 
@@ -183,10 +243,57 @@ function pendingCard(n) {
   return el;
 }
 
+// ---- docket board ------------------------------------------------------------------------
+// The papers' ruling is what the judge decided from caption + detections alone; the tape then
+// decides. When they disagree, the tape overturned the papers — the whole point of the court.
+const overturned = r => r.subpoena && (
+  (r.judge.ruling === 'ADMIT' && r.disposition === 'STRIKE') ||
+  (r.judge.ruling !== 'ADMIT' && r.disposition === 'ADMIT'));
+let tally = { ADMIT:0, STRIKE:0, NOT_REACHED:0, over:0 };
+
+function resetBoard(n) {
+  tally = { ADMIT:0, STRIKE:0, NOT_REACHED:0, over:0 };
+  $('tiles').innerHTML = '';
+  for (let i = 1; i <= n; i++) {
+    const t = document.createElement('div'); t.className = 'tile pending'; t.id = 'tile' + i; t.title = `Exhibit ${i}: awaiting the court`;
+    t.onclick = () => { const ex = $('ex' + i); if (!ex) return;
+      setFilter(''); ex.scrollIntoView({ behavior:'smooth', block:'center' });
+      ex.classList.remove('flash'); void ex.offsetWidth; ex.classList.add('flash'); };
+    $('tiles').appendChild(t);
+  }
+  $('board').style.display = n ? 'block' : 'none';
+  updateScore(n);
+}
+
+function updateScore(n = docket) {
+  $('sc-admit').textContent = tally.ADMIT; $('sc-strike').textContent = tally.STRIKE; $('sc-over').textContent = tally.over;
+  $('sc-pending').textContent = Math.max(0, n - tally.ADMIT - tally.STRIKE - tally.NOT_REACHED);
+}
+
+function markTile(r) {
+  const t = $('tile' + r.n); if (!t) return;
+  const over = overturned(r);
+  t.className = `tile ${r.disposition}${over ? ' over' : ''}`;
+  t.textContent = over ? '⚡' : '';
+  const papers = r.judge.ruling === 'SUBPOENA' ? 'undecided' : r.judge.ruling.toLowerCase();
+  t.title = `Exhibit ${r.n} · ${r.chunk} @ ${Number(r.segment.ts)}s\npapers: ${papers} → tape: ${r.disposition.toLowerCase()}`
+    + (r.subpoena ? `\n${r.subpoena.reason}` : '');
+  tally[r.disposition] = (tally[r.disposition] || 0) + 1;
+  if (over) tally.over++;
+  updateScore();
+}
+
+function setFilter(f) {
+  $('exhibits').className = f ? 'f-' + f : '';
+  for (const b of document.querySelectorAll('.filters button')) b.classList.toggle('on', b.dataset.f === f);
+}
+for (const b of document.querySelectorAll('.filters button')) b.onclick = () => setFilter(b.dataset.f);
+
 function renderExhibit(r) {
   const seg = r.segment, nb = r.neighbors || {};
   const el = $('ex' + r.n) || pendingCard(r.n);
-  el.className = 'exhibit panel';
+  const over = overturned(r);
+  el.className = `exhibit panel d-${r.disposition}${over ? ' over' : ''}`;
   let right = line('PROSECUTION', esc(r.prosecution));
   if (r.defense.withdrawn) {
     const w = r.defense.withdrawn;
@@ -209,7 +316,9 @@ function renderExhibit(r) {
   if (r.subpoena) {
     for (const a of r.subpoena.answers || []) {
       right += line('THE COURT ASKS', `<span class="q">${esc(a.question)}</span>`);
-      right += line('THE TAPE ANSWERS', `<b>${esc(a.answer)}</b> — ${esc(a.reason)}`);
+      const said = String(a.reason || '').replace(/[.\s]/g, '').toLowerCase();
+      right += line('THE TAPE ANSWERS', `<b>${esc(a.answer)}</b> — ${['yes', 'no', 'unclear', ''].includes(said)
+        ? '<span class="muted">no reason given</span>' : esc(a.reason)}`);
     }
     if ((r.subpoena.answers || []).length > 1 && r.subpoena.answer !== r.subpoena.answers[0].answer)
       right += line('THE COURT FINDS', `<b>${esc(r.subpoena.answer)}</b> — the answers do not agree.`);
@@ -228,14 +337,16 @@ function renderExhibit(r) {
     <div>
       <h3>Exhibit ${r.n}</h3>
       <video controls preload="metadata" src="${clipUrl(seg.id)}"></video>
-      <div class="muted" style="margin-top:6px">${where}</div>
+      <div class="muted where" style="margin-top:6px">${where}</div>
       <div class="yolo">${yoloChips(seg.yolo, seg.detector)}</div>
       <details class="cap"><summary>Caption (hearsay)</summary><p>${esc(seg.caption)}</p></details>
       ${nbHtml}
     </div>
     <div class="right">${right}</div>
-    <div class="stamp ${r.disposition}">${stampText}${why ? `<span class="why">${esc(why)}</span>` : ''}</div>`;
+    <div class="stamp ${r.disposition}">${stampText}${why ? `<span class="why">${esc(why)}</span>` : ''}</div>
+    ${over ? `<div class="overturn" title="the judge ruled ${esc(r.judge.ruling.toLowerCase())} on the caption and detections; the tape decided otherwise">⚡ tape overturned the papers</div>` : ''}`;
   if (!el.isConnected) $('exhibits').appendChild(el);
+  markTile(r);
 }
 
 function renderVerdict(trial) {
@@ -260,8 +371,18 @@ function renderVerdict(trial) {
     ${line('BAILIFF', esc(v.bailiff))}
     <div style="margin-top:6px"><b>SENTENCE:</b> ${v.guilty
       ? `guilty — hazard report drafted${trial.report ? ` <span class="muted">(${esc(trial.report)})</span>` : ''}, listing ${v.admitted} admitted exhibit${v.admitted === 1 ? '' : 's'} with playback.`
-      : 'not guilty — case dismissed.'}</div>`;
+      : 'not guilty — case dismissed.'}</div>
+    ${reel(trial)}`;
   box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function reel(trial) {
+  const admitted = (trial.exhibits || []).filter(r => r.disposition === 'ADMIT').slice(0, 8);
+  if (!admitted.length) return '';
+  return `<div class="muted" style="margin-top:14px">THE EVIDENCE — what the tape showed</div><div class="reel">` +
+    admitted.map(r => `<figure><video src="${clipUrl(r.segment.id)}" muted autoplay loop playsinline preload="auto"></video>
+      <figcaption>Exhibit ${r.n} · ${esc(r.chunk)} @ ${Number(r.segment.ts)}s<br>${esc((r.subpoena && r.subpoena.reason) || '')}</figcaption></figure>`).join('') +
+    `</div>`;
 }
 
 function setSession(text, live) {
@@ -273,6 +394,7 @@ function attach(id) {
   if (es) es.close();
   rendered = new Set(); lines = []; docket = 0;
   $('exhibits').innerHTML = ''; $('verdict').style.display = 'none'; $('dl').style.display = 'none';
+  setFilter(''); resetBoard(0);
   location.hash = 'trial=' + id;
   setSession('Court is in session. The prosecution is gathering exhibits…', true);
   es = new EventSource(`${BASE}api/trial/${id}/events`);
@@ -280,6 +402,7 @@ function attach(id) {
     docket = JSON.parse(e.data).exhibits;
     if (!docket) { setSession('The prosecution found no exhibits for this claim on this camera.', false); return; }
     for (let n = 1; n <= docket; n++) if (!$('ex' + n)) $('exhibits').appendChild(pendingCard(n));
+    resetBoard(docket);
     setSession(`${docket} exhibits on the docket. The court is hearing exhibit 1…`, true);
   });
   es.addEventListener('exhibit', e => {
