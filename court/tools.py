@@ -1,12 +1,260 @@
-"""Court retrieval tools — committed signatures; demo stubs for now."""
+"""Court retrieval tools — ``search`` is wired to the VSS retrieval API; the rest are demo stubs."""
 
 from __future__ import annotations
 
+import glob
+import json
 import os
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Any
 
 # When set, forces the fake-data path even after real VSS implementations exist.
 DEMO_MODE: bool = os.environ.get("COURT_DEMO") == "1"
+
+# ---------------------------------------------------------------------------
+# VSS backend: credentials, cached JWT, HTTP helper
+# ---------------------------------------------------------------------------
+
+# Skill-documented names first, then the aliases the deployed app uses.
+_ENV_ALIASES: dict[str, tuple[str, ...]] = {
+    "INGRESS_URL": ("INGRESS_URL", "VSS_URL", "BACKEND"),
+    "USERNAME": ("USERNAME", "VSS_USERNAME"),
+    "PASSWORD": ("PASSWORD", "VSS_PASSWORD"),
+}
+_CONFIG_GLOB = "/config/*.config"
+_HTTP_TIMEOUT = float(os.environ.get("COURT_VSS_TIMEOUT", "120"))
+
+_config_cache: dict[str, str] | None = None
+_token: str | None = None
+_token_lock = threading.Lock()
+
+
+def _read_team_config() -> dict[str, str]:
+    """Parse ``/config/<team>.config`` (KEY=VALUE lines) once. Values are never logged."""
+    global _config_cache
+    if _config_cache is not None:
+        return _config_cache
+    values: dict[str, str] = {}
+    for path in sorted(glob.glob(_CONFIG_GLOB)):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for raw in fh:
+                    line = raw.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    if line.startswith("export "):
+                        line = line[len("export "):]
+                    key, _, val = line.partition("=")
+                    val = val.strip()
+                    if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+                        val = val[1:-1]
+                    values.setdefault(key.strip(), val)
+        except OSError:
+            continue
+    _config_cache = values
+    return values
+
+
+def _setting(name: str) -> str:
+    """Resolve a setting from the environment (any alias) or the team config file."""
+    for alias in _ENV_ALIASES.get(name, (name,)):
+        val = os.environ.get(alias)
+        if val:
+            return val
+    cfg = _read_team_config()
+    for alias in _ENV_ALIASES.get(name, (name,)):
+        if cfg.get(alias):
+            return cfg[alias]
+    raise RuntimeError(
+        f"{name} is not set. Export it or make sure {_CONFIG_GLOB} exists (see config.example)."
+    )
+
+
+def _base_url() -> str:
+    return _setting("INGRESS_URL").rstrip("/")
+
+
+def _login() -> str:
+    body = json.dumps({"username": _setting("USERNAME"), "password": _setting("PASSWORD")}).encode()
+    req = urllib.request.Request(
+        f"{_base_url()}/api/v1/auth/login",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
+            payload = json.load(resp)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            raise RuntimeError("VSS login rejected (401): check USERNAME/PASSWORD for this tenant.") from None
+        raise RuntimeError(f"VSS login failed with HTTP {exc.code}") from None
+    token = payload.get("access_token")
+    if not token:
+        raise RuntimeError("VSS login response had no access_token")
+    return token
+
+
+def _get_token(refresh: bool = False) -> str:
+    """Return the cached JWT, logging in (or re-logging in when ``refresh``) as needed."""
+    global _token
+    with _token_lock:
+        if _token and not refresh:
+            return _token
+        _token = _login()
+        return _token
+
+
+def _api(
+    method: str,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    body: dict[str, Any] | None = None,
+    token_in_query: bool = False,
+) -> Any:
+    """Call ``/api/v1/<path>`` with the cached JWT; on 401 re-login once and retry.
+
+    Raises :class:`urllib.error.HTTPError` for non-401 failures so callers can
+    treat e.g. 404 as "not available".
+    """
+    for attempt in range(2):
+        token = _get_token(refresh=attempt > 0)
+        query = dict(params or {})
+        headers = {"Accept": "application/json"}
+        if token_in_query:
+            query["token"] = token
+        else:
+            headers["Authorization"] = f"Bearer {token}"
+        url = f"{_base_url()}/api/v1/{path.lstrip('/')}"
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
+                raw = resp.read()
+                return json.loads(raw) if raw else None
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401 and attempt == 0:
+                continue  # token expired or revoked: refresh and retry once
+            raise
+    raise RuntimeError("unreachable")  # pragma: no cover
+
+
+def _playback_url(source: str) -> str:
+    """Seekable proxy stream URL; this endpoint takes the JWT as ``?token=``."""
+    query = urllib.parse.urlencode({"source": source, "token": _get_token()})
+    return f"{_base_url()}/api/v1/videos/stream?{query}"
+
+
+# ---------------------------------------------------------------------------
+# VSS response → contract dict
+# ---------------------------------------------------------------------------
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    """VastDB returns JSON columns as strings; accept either form."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _yolo_counts(hit: dict[str, Any]) -> dict[str, int]:
+    """``{class: count}`` from ``object_counts`` (falls back to ``perception_json``)."""
+    counts = _as_dict(hit.get("object_counts")) or _as_dict(hit.get("perception_json")).get("object_counts") or {}
+    out: dict[str, int] = {}
+    for cls, n in counts.items():
+        try:
+            out[str(cls)] = int(n)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _bboxes(hit: dict[str, Any]) -> list[dict[str, Any]]:
+    """Per-object boxes for the segment's densest frame, from the YOLO sidecar.
+
+    Returns ``[]`` when there is no sidecar (404) or the request fails; bboxes are
+    best-effort and must never break a search.
+    """
+    source = hit.get("source")
+    if not source:
+        return []
+    try:
+        sidecar = _api("GET", "videos/detections", params={"source": source})
+    except (urllib.error.URLError, RuntimeError, ValueError):
+        return []
+    frames = (sidecar or {}).get("frames") or []
+    if not frames:
+        return []
+    # object_counts are "max per frame"; the frame with the most detections matches them.
+    best = max(frames, key=lambda f: len(f.get("detections") or []))
+    boxes: list[dict[str, Any]] = []
+    for det in best.get("detections") or []:
+        bbox = det.get("bbox") or det.get("xyxy")
+        if not bbox or len(bbox) != 4:
+            continue
+        boxes.append(
+            {
+                "class": det.get("label") or det.get("class"),
+                "confidence": det.get("confidence"),
+                "xyxy": [float(v) for v in bbox],
+            }
+        )
+    return boxes
+
+
+def _to_segment(hit: dict[str, Any], *, with_bboxes: bool) -> dict[str, Any]:
+    source = hit.get("source") or ""
+    return {
+        "id": source or hit.get("filename") or "",
+        "video": hit.get("original_video") or source,
+        "ts": float(hit.get("segment_start_sec") or 0.0),
+        "caption": (hit.get("reasoning_content") or "").strip(),
+        "yolo": _yolo_counts(hit),
+        "bboxes": _bboxes(hit) if with_bboxes else [],
+        "playback_url": _playback_url(source) if source else "",
+    }
+
+
+def _vss_search(
+    query: str,
+    camera: str | None = None,
+    k: int = 10,
+    *,
+    min_similarity: float = 0.1,
+    with_bboxes: bool = True,
+) -> list[dict]:
+    body: dict[str, Any] = {
+        "query": query,
+        "top_k": max(1, min(int(k), 100)),
+        "llm_top_n": 1,  # backend requires >= 1; we ignore the synthesis
+        "min_similarity": min_similarity,
+        "include_public": True,
+    }
+    if camera:
+        body["metadata_filters"] = {"camera_id": camera}
+    resp = _api("POST", "search", body=body) or {}
+    hits = resp.get("results") or []
+    return [_to_segment(h, with_bboxes=with_bboxes) for h in hits[: body["top_k"]]]
+
+
+# ---------------------------------------------------------------------------
+# Demo fixtures
+# ---------------------------------------------------------------------------
 
 # Shared bbox payload used by the three demo segments (caption/yolo disagreement fixture).
 _SHARED_BBOXES: list[dict[str, Any]] = [
@@ -102,11 +350,14 @@ def search(query: str, camera: str | None = None, k: int = 10) -> list[dict]:
 
     Returns a list of segment dicts, each with keys:
     ``id``, ``video``, ``ts``, ``caption``, ``yolo``, ``bboxes``, ``playback_url``.
+
+    ``id``/``playback_url`` refer to the 5-second segment clip, ``video`` to its
+    parent upload, ``ts`` to the segment start (seconds into the parent).
+    ``camera`` filters on the ``camera_id`` metadata column when given.
     """
     if DEMO_MODE:
         return _demo_search(query, camera=camera, k=k)
-    # Real VSS path not wired yet — stubs still return fake data.
-    return _demo_search(query, camera=camera, k=k)
+    return _vss_search(query, camera=camera, k=k)
 
 
 def neighbors(segment_id: str) -> tuple[dict | None, dict | None]:
