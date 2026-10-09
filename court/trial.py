@@ -229,8 +229,12 @@ def view_tape(segment_id: str, question: str, foundation: str) -> dict:
 # Per-exhibit record — the one object the transcript, ledger, report and UI all render.
 # ---------------------------------------------------------------------------
 
-# Why an exhibit ended up struck. "budget" is a court-capacity failure, not an evidence failure.
-STRUCK_FOR = ("objection", "tape", "unclear", "budget")
+# Final disposition of an exhibit. NOT_REACHED = the judge wanted the tape but the subpoena
+# budget was spent; that is a court-capacity limit, not an evidence failure, so it counts
+# neither for nor against the claim.
+DISPOSITIONS = ("ADMIT", "STRIKE", "NOT_REACHED")
+# Why a STRIKE happened.
+STRUCK_FOR = ("objection", "tape", "unclear")
 
 
 def _public_segment(segment: dict) -> dict:
@@ -273,8 +277,7 @@ def try_exhibit(claim: str, n: int, segment: dict, camera: str | None, budget: i
             if disposition == "STRIKE":
                 struck_for = "unclear" if subpoena["answer"] == "unclear" else "tape"
         else:
-            disposition = "STRIKE"
-            struck_for = "budget"
+            disposition = "NOT_REACHED"
     elif disposition == "STRIKE":
         struck_for = "objection"
 
@@ -318,7 +321,7 @@ def exhibit_lines(record: dict) -> list[str]:
             if len(sub["answers"]) > 1 and sub["answer"] != sub["answers"][0]["answer"]:
                 lines.append(f"  THE COURT FINDS: {sub['answer']} — the answers do not agree.")
         else:
-            lines.append("  THE COURT DECLINES TO VIEW THE TAPE: subpoena budget exhausted; exhibit struck.")
+            lines.append("  THE COURT DECLINES TO VIEW THE TAPE: subpoena budget exhausted; exhibit not reached.")
     lines.append("")
     return lines
 
@@ -349,11 +352,14 @@ def run_trial(claim: str, camera: str | None, k: int, subpoenas: int) -> tuple[l
             f.write(json.dumps({"claim": claim, **record}) + "\n")
 
     admitted = [r for r in records if r["disposition"] == "ADMIT"]
-    struck = len(records) - len(admitted)
+    struck = sum(r["disposition"] == "STRIKE" for r in records)
+    not_reached = sum(r["disposition"] == "NOT_REACHED" for r in records)
     breakdown = _strike_breakdown(records)
-    total = len(records)
-    confidence = len(admitted) / total if total else 0.0
-    guilty = bool(total) and confidence >= 0.5
+    # Only exhibits the court actually decided count. An exhibit the court could not afford to
+    # view says nothing about the claim, so it is excluded from the denominator.
+    decided = len(admitted) + struck
+    confidence = len(admitted) / decided if decided else 0.0
+    guilty = bool(decided) and confidence >= 0.5
     # The outcome is decided here, not by the bailiff; without it the model can announce
     # "guilty" on a record of zero admitted exhibits.
     outcome = "guilty" if guilty else "not guilty — case dismissed"
@@ -361,10 +367,14 @@ def run_trial(claim: str, camera: str | None, k: int, subpoenas: int) -> tuple[l
     bailiff = _first_sentence(chat(
         BAILIFF,
         f"Claim: {claim}\nExhibits admitted: {len(admitted)}\nExhibits struck: {struck}\n"
+        f"Exhibits not reached (subpoena budget exhausted; not counted): {not_reached}\n"
         f"Outcome (already decided): {outcome}",
         model=REASONING_MODEL,
     ))
-    lines.append(f"VERDICT  [admitted {len(admitted)} · struck {struck} · confidence {confidence:.2f}]")
+    tally = f"admitted {len(admitted)} · struck {struck}"
+    if not_reached:
+        tally += f" · not reached {not_reached}"
+    lines.append(f"VERDICT  [{tally} · confidence {confidence:.2f}]")
     if struck:
         why = " · ".join(f"{v} {k}" for k, v in breakdown.items() if v)
         lines.append(f"  STRUCK FOR:  {why}")
@@ -380,6 +390,7 @@ def run_trial(claim: str, camera: str | None, k: int, subpoenas: int) -> tuple[l
         "verdict": {
             "admitted": len(admitted),
             "struck": struck,
+            "not_reached": not_reached,
             "struck_for": breakdown,
             "confidence": confidence,
             "guilty": guilty,
@@ -409,27 +420,30 @@ def write_report(trial: dict) -> str:
 
     def struck_row(r: dict) -> str:
         seg = r["segment"]
-        why = r["struck_for"] or ""
-        if r["struck_for"] == "objection":
+        if r["disposition"] == "NOT_REACHED":
+            why = "not reached: subpoena budget exhausted (not counted)"
+        elif r["struck_for"] == "objection":
             why = f"objection ({r['defense']['objection']}): {r['defense']['reason']}"
         elif r["subpoena"]:
             why = f"tape ({r['subpoena']['answer']}): {r['subpoena']['reason']}"
-        elif r["struck_for"] == "budget":
-            why = "not viewed: subpoena budget exhausted"
-        return f"| {r['n']} | {r['chunk']} | {seg['ts']:g}s | {why} |"
+        else:
+            why = r["struck_for"] or ""
+        return f"| {r['n']} | {r['chunk']} | {seg['ts']:g}s | {r['disposition']} | {why} |"
 
+    not_reached = f", {v['not_reached']} not reached" if v["not_reached"] else ""
     path.write_text(
         f"# Hazard report\n\n"
         f"**Claim:** {trial['claim']}  \n"
         f"**Camera:** {trial['camera'] or 'all'}  \n"
-        f"**Verdict:** guilty — {v['admitted']} admitted, {v['struck']} struck, confidence {v['confidence']:.2f}  \n"
+        f"**Verdict:** guilty — {v['admitted']} admitted, {v['struck']} struck{not_reached}, "
+        f"confidence {v['confidence']:.2f}  \n"
         f"**Filed:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         f"## Admitted exhibits\n\n"
         f"| # | Chunk | ts | Segment | Caption |\n|---|---|---|---|---|\n"
         + "\n".join(row(r) for r in admitted)
-        + "\n\n## Struck exhibits\n\n"
-        f"| # | Chunk | ts | Struck for |\n|---|---|---|---|\n"
-        + ("\n".join(struck_row(r) for r in struck) or "| – | – | – | none |")
+        + "\n\n## Struck and not-reached exhibits\n\n"
+        f"| # | Chunk | ts | Disposition | Why |\n|---|---|---|---|---|\n"
+        + ("\n".join(struck_row(r) for r in struck) or "| – | – | – | – | none |")
         + "\n"
     )
     return str(path.relative_to(COURT_DIR.parent))
