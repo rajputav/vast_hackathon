@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -88,6 +89,19 @@ def _clean(text: str) -> str:
     return " ".join(str(text).split()).strip().strip('"').strip()
 
 
+def _first_sentence(text: str) -> str:
+    """Models tack on extras ('Number of exhibits admitted: 2 ...') after the asked-for sentence."""
+    text = _clean(text)
+    match = re.match(r'(.+?[.!?])["”]?(\s|$)', text)
+    return _clean(match.group(1)) if match else text
+
+
+def _chunk_name(segment: dict) -> str:
+    """'s3://…/20261008_073013_GOPR0130_chunk_0015.mp4' -> 'GOPR0130_chunk_0015'."""
+    name = Path(str(segment.get("video") or segment.get("id") or "?")).stem
+    return re.sub(r"^\d{8}_\d{6}_", "", name)
+
+
 def prosecute(claim: str, segment: dict) -> str:
     return _clean(chat(PROSECUTOR, f"Claim: {claim}\nCaption: {segment['caption']}"))
 
@@ -135,7 +149,9 @@ def run_trial(claim: str, camera: str | None, k: int, subpoenas: int) -> tuple[l
     exhibits = search(claim, camera=camera, k=k)
     for n, segment in enumerate(exhibits, start=1):
         prev, nxt = neighbors(segment["id"])
-        lines.append(f"EXHIBIT {n}  [{camera or segment.get('video', '?')} @ {segment['ts']}]")
+        # ts is relative to the parent chunk, so the chunk name is what tells exhibits apart.
+        where = f"{camera} · {_chunk_name(segment)}" if camera else _chunk_name(segment)
+        lines.append(f"EXHIBIT {n}  [{where} @ {segment['ts']:g}s]")
         lines.append(f"  PROSECUTION: {prosecute(claim, segment)}")
 
         objection = defend(claim, segment, prev, nxt)
@@ -184,10 +200,12 @@ def run_trial(claim: str, camera: str | None, k: int, subpoenas: int) -> tuple[l
     # The outcome is decided here, not by the bailiff; without it the model can announce
     # "guilty" on a record of zero admitted exhibits.
     outcome = "guilty" if guilty else "not guilty — case dismissed"
-    bailiff = _clean(chat(
+    # 70B: the 8B bailiff ignored the one-sentence format and appended raw counts.
+    bailiff = _first_sentence(chat(
         BAILIFF,
         f"Claim: {claim}\nExhibits admitted: {len(admitted)}\nExhibits struck: {struck}\n"
         f"Outcome (already decided): {outcome}",
+        model=REASONING_MODEL,
     ))
     lines.append(f"VERDICT  [admitted {len(admitted)} · struck {struck} · confidence {confidence:.2f}]")
     lines.append(f"  BAILIFF:     {bailiff}")
