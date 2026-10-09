@@ -76,3 +76,5 @@ Re-ingest re-captions whole videos and waits on the pipeline. A subpoena asks on
 - **Audience docket:** viewers vote before the trial, then watch the court overrule them.
 
 *Built on VAST S3, DataEngine and VastDB; NVIDIA Cosmos3-Reason, Cosmos-Embed1 and YOLO11 on CoreWeave; Weights & Biases serverless inference for the courtroom agents.*
+
+**License:** MIT ([LICENSE](LICENSE))
