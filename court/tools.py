@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import glob
 import json
 import os
+import re
+import socket
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,9 +27,15 @@ _ENV_ALIASES: dict[str, tuple[str, ...]] = {
     "INGRESS_URL": ("INGRESS_URL", "VSS_URL", "BACKEND"),
     "USERNAME": ("USERNAME", "VSS_USERNAME"),
     "PASSWORD": ("PASSWORD", "VSS_PASSWORD"),
+    "GPU_BEARER_TOKEN": ("GPU_BEARER_TOKEN", "COSMOS_TOKEN"),
+    "COSMOS3_REASON_URL": ("COSMOS3_REASON_URL", "COSMOS_URL"),
+    "COSMOS3_REASON_MODEL": ("COSMOS3_REASON_MODEL",),
 }
+# Shared GPU host documented in .cursor/skills/gpu (the URL is not in the team config).
+_DEFAULTS: dict[str, str] = {"COSMOS3_REASON_URL": "http://166.19.38.112:8001"}
 _CONFIG_GLOB = "/config/*.config"
 _HTTP_TIMEOUT = float(os.environ.get("COURT_VSS_TIMEOUT", "120"))
+_LOOK_TIMEOUT = float(os.environ.get("COURT_LOOK_TIMEOUT", "60"))
 
 _config_cache: dict[str, str] | None = None
 _token: str | None = None
@@ -68,6 +78,8 @@ def _setting(name: str) -> str:
     for alias in _ENV_ALIASES.get(name, (name,)):
         if cfg.get(alias):
             return cfg[alias]
+    if name in _DEFAULTS:
+        return _DEFAULTS[name]
     raise RuntimeError(
         f"{name} is not set. Export it or make sure {_CONFIG_GLOB} exists (see config.example)."
     )
@@ -152,6 +164,124 @@ def _playback_url(source: str) -> str:
     """Seekable proxy stream URL; this endpoint takes the JWT as ``?token=``."""
     query = urllib.parse.urlencode({"source": source, "token": _get_token()})
     return f"{_base_url()}/api/v1/videos/stream?{query}"
+
+
+def _fetch_segment_bytes(source: str, timeout: float) -> bytes:
+    """Download a segment clip through ``/videos/stream``; re-login once on 401."""
+    for attempt in range(2):
+        if attempt:
+            _get_token(refresh=True)
+        req = urllib.request.Request(_playback_url(source), headers={"Accept": "video/mp4"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401 and attempt == 0:
+                continue
+            raise
+    raise RuntimeError("unreachable")  # pragma: no cover
+
+
+# ---------------------------------------------------------------------------
+# Cosmos3-Reason GPU endpoint (OpenAI-compatible chat; see .cursor/skills/gpu)
+# ---------------------------------------------------------------------------
+
+_cosmos_model: str | None = None
+_LOOK_INSTRUCTION = (
+    "Answer with exactly one of yes / no / unclear on the first line, "
+    "then one sentence of reasoning."
+)
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_ANSWER_RE = re.compile(r"\b(yes|no|unclear)\b", re.IGNORECASE)
+
+
+def _cosmos_headers() -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {_setting('GPU_BEARER_TOKEN')}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+
+def _cosmos_model_id(timeout: float) -> str:
+    """Model id from env/config, else discovered once via ``GET /v1/models``."""
+    global _cosmos_model
+    if _cosmos_model:
+        return _cosmos_model
+    try:
+        _cosmos_model = _setting("COSMOS3_REASON_MODEL")
+        return _cosmos_model
+    except RuntimeError:
+        pass
+    req = urllib.request.Request(f"{_setting('COSMOS3_REASON_URL').rstrip('/')}/v1/models", headers=_cosmos_headers())
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.load(resp)
+    _cosmos_model = data["data"][0]["id"]
+    return _cosmos_model
+
+
+def _cosmos_chat(content: list[dict[str, Any]], *, timeout: float, max_tokens: int = 200) -> str:
+    body = {
+        "model": _cosmos_model_id(timeout=min(timeout, 10.0)),
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": max_tokens,
+        "temperature": 0,
+    }
+    req = urllib.request.Request(
+        f"{_setting('COSMOS3_REASON_URL').rstrip('/')}/v1/chat/completions",
+        data=json.dumps(body).encode(),
+        headers=_cosmos_headers(),
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.load(resp)
+    return (data["choices"][0]["message"].get("content") or "").strip()
+
+
+def _parse_look(text: str) -> dict[str, str]:
+    """First line → ``answer`` (yes/no/unclear), remainder → ``reason``."""
+    text = _THINK_RE.sub("", text).strip()
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return {"answer": "unclear", "reason": "empty model response"}
+    first, rest = lines[0], lines[1:]
+    match = _ANSWER_RE.search(first)
+    answer = match.group(1).lower() if match else "unclear"
+    # Tolerate "Yes. The truck is ..." on a single line: keep the trailing text as reason.
+    tail = first[match.end():].lstrip(" .:,;-—") if match else first
+    reason = " ".join(([tail] if tail else []) + rest).strip()
+    return {"answer": answer, "reason": reason or first}
+
+
+def _vss_look(segment_id: str, question: str) -> dict:
+    """Send the segment clip + question to Cosmos3-Reason; never raises."""
+    deadline = time.monotonic() + _LOOK_TIMEOUT
+
+    def remaining() -> float:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError
+        return left
+
+    try:
+        if not segment_id.startswith("s3://"):
+            return {"answer": "unclear", "reason": f"unknown segment id: {segment_id}"}
+        clip = _fetch_segment_bytes(segment_id, timeout=remaining())
+        b64 = base64.b64encode(clip).decode()
+        content = [
+            {"type": "text", "text": f"{question.strip()}\n{_LOOK_INSTRUCTION}"},
+            {"type": "video_url", "video_url": {"url": f"data:video/mp4;base64,{b64}"}},
+        ]
+        return _parse_look(_cosmos_chat(content, timeout=remaining()))
+    except (TimeoutError, socket.timeout):
+        return {"answer": "unclear", "reason": "timeout"}
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            return {"answer": "unclear", "reason": "timeout"}
+        detail = f"HTTP {exc.code}" if isinstance(exc, urllib.error.HTTPError) else str(exc.reason)
+        return {"answer": "unclear", "reason": f"error: {detail}"}
+    except Exception as exc:  # noqa: BLE001 - look() must never break the caller
+        return {"answer": "unclear", "reason": f"error: {type(exc).__name__}: {exc}"[:200]}
 
 
 # ---------------------------------------------------------------------------
@@ -375,8 +505,11 @@ def look(segment_id: str, question: str) -> dict:
     """Answer a yes/no visual question about a segment.
 
     Returns ``{"answer": "yes"|"no"|"unclear", "reason": str}``.
+
+    ``segment_id`` is the segment clip URI returned by :func:`search` (``id``).
+    The clip is sent to Cosmos3-Reason as base64 video with the question; a
+    60s overall budget applies and failures yield ``unclear`` instead of raising.
     """
     if DEMO_MODE:
         return _demo_look(segment_id, question)
-    # Real VSS path not wired yet — stubs still return fake data.
-    return _demo_look(segment_id, question)
+    return _vss_look(segment_id, question)
