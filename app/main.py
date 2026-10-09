@@ -248,13 +248,16 @@ class TrialReq(BaseModel):
     claim: str
     camera: str | None = None
     k: int = 10
-    subpoenas: int = 4
+    subpoenas: int | None = None  # cap on tapes viewed; None = the court views every exhibit
+    whole_videos: bool = False    # try every segment of each video the search turns up
 
 
 def _run_trial(trial: Trial) -> None:
     req = trial.request
     try:
-        for event in iter_trial(req["claim"], req["camera"], req["k"], req["subpoenas"]):
+        for event in iter_trial(
+            req["claim"], req["camera"], req["k"], req["subpoenas"], whole_videos=req["whole_videos"]
+        ):
             trial.publish(event)
     except Exception as exc:  # the UI needs to hear about it, not a dead stream
         trial.error = f"{type(exc).__name__}: {exc}"[:300]

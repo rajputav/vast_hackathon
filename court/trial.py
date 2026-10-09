@@ -1,7 +1,10 @@
 """Court trial — put a claim about the archive on trial, one exhibit at a time.
 
-    python -m court.trial --claim "..." --camera nyc_bike_gopro-1 --k 10 --subpoenas 4 \
+    python -m court.trial --claim "..." --camera nyc_bike_gopro-1 --k 10 \
         --out transcript.txt --json trial.json
+
+Nothing is admitted on the papers: every exhibit's tape is viewed (unless --subpoenas caps it),
+and only the tape can admit. A tape that shows the claimed conduct can be struck only on scope.
 
 Every exhibit becomes one record (see ``try_exhibit``) that the transcript, the ledger, the
 hazard report and ``--json`` all render; UIs should consume the record, not the prose.
@@ -14,11 +17,12 @@ import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 from court.llm import chat
-from court.tools import look, neighbors, search
+from court.tools import look, neighbors, search, segments
 
 COURT_DIR = Path(__file__).parent
 # Where the ledger and hazard reports go. In the pod the code is a read-only ConfigMap
@@ -37,6 +41,18 @@ PROSECUTOR = (
     "support of the claim. Never mention detections. Never hedge."
 )
 
+COCO_CLASSES = (
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
+    "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard",
+    "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+    "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
+    "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard",
+    "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors",
+    "teddy bear", "hair drier", "toothbrush",
+)
+
 DEFENSE = (
     "You are defense counsel. Captions are written by a vision-language model and are hearsay; YOLO "
     "detections and adjacent segments are physical evidence. Your duty is to object whenever this exhibit "
@@ -53,6 +69,10 @@ DEFENSE = (
     "segment and is the authoritative detection record. 'bboxes' are boxes from one representative frame, so a "
     "class present in 'yolo' but missing from 'bboxes' is NOT a contradiction. 'previous_segment' and "
     "'next_segment' are the adjacent 5-second segments of the same video.\n\n"
+    "The detector is YOLO trained on the 80 COCO classes: " + ", ".join(COCO_CLASSES) + ". It cannot see "
+    "anything else — a forklift, pallet jack, scooter, cart or shelving rack is never in 'yolo' even when it "
+    "is plainly on screen, so its absence is no evidence at all. Only object 'object' when the caption's actor "
+    "is a COCO class.\n\n"
     "Objection types:\n"
     "- 'object': the caption's actor class is absent from 'yolo', or 'yolo' shows a different class where the "
     "actor should be (caption says truck, yolo saw only bus). Never object 'object' because bboxes omit a class "
@@ -74,16 +94,15 @@ DEFENSE = (
 
 JUDGE = (
     "You are the judge. You rule on one exhibit given the claim, the caption, the detections, and the "
-    "defense's objection. ADMIT only if the caption asserts what the claim requires, the detections corroborate "
+    "defense's objection. This is a ruling on the papers only: the court then views the tape of every "
+    "exhibit, and nothing is admitted unless the tape shows it. ADMIT only if the caption asserts what the claim requires, the detections corroborate "
     "it, and no valid objection stands. Overrule and ADMIT when the objection is contradicted by the record "
     "(an 'object' objection where 'yolo' contains the class; a 'scope' objection where the caption plainly "
     "asserts the element; any objection that one clip does not prove a pattern — frequency words like "
     "'routinely' are decided at verdict, not per exhibit). STRIKE when the objection is supported by the record: "
     "the caption never asserts the required state or action at all, or the detections contradict the actor. "
-    "Subpoenas are scarce: SUBPOENA only when the caption asserts the actor AND the state and the sole open "
-    "question is the place — for example the caption says 'parked, partially blocking the lane' and the question "
-    "is whether that lane is the bike lane.\n\n"
-    "When you SUBPOENA, write two yes/no questions for a model that sees only the pixels of a 5-second clip "
+    "SUBPOENA when the papers cannot settle it either way.\n\n"
+    "Whatever your ruling, always write two yes/no questions for a model that sees only the pixels of a 5-second clip "
     "(it has not read the caption or the claim). 'question' decides the open element; 'foundation' checks the "
     "premise that question takes for granted — that the place, marking or object it refers to is actually "
     "visible (e.g. 'Is a painted or signed bike lane visible on this street?'). Both must be neutral: ask about "
@@ -118,6 +137,19 @@ JUDGE_SCHEMA = {
 }
 
 LOOK_TO_RULING = {"yes": "ADMIT", "no": "STRIKE", "unclear": "STRIKE"}
+
+# A claim with a frequency word alleges a pattern: guilty only if most decided exhibits are admitted.
+# Without one it alleges an incident ("a forklift hits a person"): one admitted exhibit proves it,
+# and the other angles and moments that don't show it are no defense.
+PATTERN_WORDS = re.compile(
+    r"\b(routinely|often|usually|always|frequently|repeatedly|regularly|typically|commonly|habitually|"
+    r"constantly|tends? to|every|keeps?)\b",
+    re.IGNORECASE,
+)
+
+
+def is_pattern_claim(claim: str) -> bool:
+    return bool(PATTERN_WORDS.search(claim))
 ANSWERS = ("yes", "no", "unclear")
 
 
@@ -181,9 +213,7 @@ def rule(claim: str, segment: dict, objection: dict) -> dict:
     ruling = str(result.get("ruling", "")).upper()
     if ruling not in RULINGS:  # an unparseable ruling can't be settled on the papers
         ruling = "SUBPOENA"
-    question = _clean(result.get("question", ""))
-    if ruling == "SUBPOENA" and not question:
-        question = f"Does this clip show the following: {claim}?"
+    question = _clean(result.get("question", "")) or f"Does this clip show the following: {claim}?"
     return {
         "ruling": ruling,
         "question": question,
@@ -232,9 +262,9 @@ def view_tape(segment_id: str, question: str, foundation: str) -> dict:
 # Per-exhibit record — the one object the transcript, ledger, report and UI all render.
 # ---------------------------------------------------------------------------
 
-# Final disposition of an exhibit. NOT_REACHED = the judge wanted the tape but the subpoena
-# budget was spent; that is a court-capacity limit, not an evidence failure, so it counts
-# neither for nor against the claim.
+# Final disposition of an exhibit. NOT_REACHED = the papers didn't strike it and the court's cap on
+# tapes (--subpoenas) was spent before its turn; that is a court-capacity limit, not an evidence
+# failure, so it counts neither for nor against the claim.
 DISPOSITIONS = ("ADMIT", "STRIKE", "NOT_REACHED")
 # Why a STRIKE happened.
 STRUCK_FOR = ("objection", "tape", "unclear")
@@ -259,32 +289,33 @@ def _neighbor_record(segment: dict | None) -> dict | None:
     }
 
 
-def try_exhibit(claim: str, n: int, segment: dict, camera: str | None, budget: int) -> tuple[dict, int]:
-    """Run one exhibit through prosecution, defense, judge and (maybe) the tape.
+def try_exhibit(claim: str, n: int, segment: dict, camera: str | None, may_view: bool) -> dict:
+    """Run one exhibit through prosecution, defense, the judge on the papers, then the tape.
 
-    Returns the exhibit record and the remaining subpoena budget.
+    The papers alone can strike but never admit. When ``may_view`` the tape is always viewed and
+    decides: yes admits (unless the defense showed the exhibit is out of scope), no or unclear strikes.
+    A caption or detector disagreeing with the tape doesn't outrank it — the detector can't even see
+    a forklift. Without ``may_view`` an exhibit the papers didn't strike is NOT_REACHED.
     """
     prev, nxt = neighbors(segment["id"])
     prosecution = prosecute(claim, segment)
     defense = defend(claim, segment, prev, nxt)
     judge = rule(claim, segment, defense)
 
-    subpoena: dict | None = None
-    disposition = judge["ruling"]
+    subpoena = view_tape(segment["id"], judge["question"], judge["foundation"]) if may_view else None
+    struck_on_scope = judge["ruling"] == "STRIKE" and defense["objection"] == "scope"
     struck_for: str | None = None
-    if disposition == "SUBPOENA":
-        if budget > 0:
-            budget -= 1
-            subpoena = view_tape(segment["id"], judge["question"], judge["foundation"])
-            disposition = LOOK_TO_RULING[subpoena["answer"]]
-            if disposition == "STRIKE":
-                struck_for = "unclear" if subpoena["answer"] == "unclear" else "tape"
-        else:
-            disposition = "NOT_REACHED"
-    elif disposition == "STRIKE":
-        struck_for = "objection"
+    if subpoena is None:
+        disposition = "STRIKE" if judge["ruling"] == "STRIKE" else "NOT_REACHED"
+        struck_for = "objection" if disposition == "STRIKE" else None
+    elif subpoena["answer"] == "yes":
+        disposition = "STRIKE" if struck_on_scope else "ADMIT"
+        struck_for = "objection" if struck_on_scope else None
+    else:
+        disposition = "STRIKE"
+        struck_for = "unclear" if subpoena["answer"] == "unclear" else "tape"
 
-    record = {
+    return {
         "n": n,
         "camera": camera,
         "chunk": _chunk_name(segment),
@@ -297,7 +328,6 @@ def try_exhibit(claim: str, n: int, segment: dict, camera: str | None, budget: i
         "disposition": disposition,
         "struck_for": struck_for,
     }
-    return record, budget
 
 
 def exhibit_lines(record: dict) -> list[str]:
@@ -315,16 +345,18 @@ def exhibit_lines(record: dict) -> list[str]:
     else:
         lines.append(f"  DEFENSE:     Objection ({defense['objection']}). {defense['reason']}")
     lines.append(f"  JUDGE:       {record['judge']['line']}")
-    if record["judge"]["ruling"] == "SUBPOENA":
-        if record["subpoena"]:
-            sub = record["subpoena"]
-            for a in sub["answers"]:
-                lines.append(f"  THE COURT ASKS: {a['question']}")
-                lines.append(f"  THE TAPE ANSWERS: {a['answer']} — {a['reason']}")
-            if len(sub["answers"]) > 1 and sub["answer"] != sub["answers"][0]["answer"]:
-                lines.append(f"  THE COURT FINDS: {sub['answer']} — the answers do not agree.")
-        else:
-            lines.append("  THE COURT DECLINES TO VIEW THE TAPE: subpoena budget exhausted; exhibit not reached.")
+    if record["subpoena"]:
+        sub = record["subpoena"]
+        for a in sub["answers"]:
+            lines.append(f"  THE COURT ASKS: {a['question']}")
+            reason = a["reason"] if a["reason"].strip(".").lower() not in ANSWERS else "no reason given"
+            lines.append(f"  THE TAPE ANSWERS: {a['answer']} — {reason}")
+        if len(sub["answers"]) > 1 and sub["answer"] != sub["answers"][0]["answer"]:
+            lines.append(f"  THE COURT FINDS: {sub['answer']} — the answers do not agree.")
+    elif record["disposition"] == "NOT_REACHED":
+        lines.append("  THE COURT DECLINES TO VIEW THE TAPE: subpoena budget exhausted; exhibit not reached.")
+    lines.append(f"  RULING:      {record['disposition']}"
+                 + (f" ({record['struck_for']})" if record["struck_for"] else ""))
     lines.append("")
     return lines
 
@@ -337,8 +369,28 @@ def _strike_breakdown(records: list[dict]) -> dict[str, int]:
     return counts
 
 
-def iter_trial(claim: str, camera: str | None, k: int, subpoenas: int):
+def gather_exhibits(claim: str, camera: str | None, k: int, whole_videos: bool) -> list[dict]:
+    """Top-k search hits; with ``whole_videos``, every segment of every video those hits came from."""
+    hits = search(claim, camera=camera, k=k)
+    if not whole_videos:
+        return hits
+    videos = list(dict.fromkeys(h["video"] for h in hits))
+    return [seg for video in videos for seg in segments(video)]
+
+
+def iter_trial(
+    claim: str,
+    camera: str | None,
+    k: int,
+    subpoenas: int | None = None,
+    *,
+    whole_videos: bool = False,
+    workers: int = 6,
+):
     """Run a trial, yielding events as the court works so a UI can show it unfolding.
+
+    ``subpoenas`` caps how many tapes the court views (in docket order); None views them all.
+    Exhibits are tried ``workers`` at a time but always yielded in docket order.
 
     Events (dicts with a ``type`` key):
       ``docket``  — ``{"exhibits": n}`` once search() has returned
@@ -347,23 +399,31 @@ def iter_trial(claim: str, camera: str | None, k: int, subpoenas: int):
     """
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     records: list[dict] = []
-    budget = subpoenas
 
-    exhibits = search(claim, camera=camera, k=k)
+    exhibits = gather_exhibits(claim, camera, k, whole_videos)
     yield {"type": "docket", "exhibits": len(exhibits)}
 
-    for n, segment in enumerate(exhibits, start=1):
-        record, budget = try_exhibit(claim, n, segment, camera, budget)
-        records.append(record)
-        with LEDGER.open("a") as f:
-            f.write(json.dumps({"claim": claim, **record}) + "\n")
-        yield {"type": "exhibit", "record": record, "lines": exhibit_lines(record)}
+    views = len(exhibits) if subpoenas is None else max(0, subpoenas)
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = [
+            pool.submit(try_exhibit, claim, n, segment, camera, n <= views)
+            for n, segment in enumerate(exhibits, start=1)
+        ]
+        for future in futures:
+            record = future.result()
+            records.append(record)
+            with LEDGER.open("a") as f:
+                f.write(json.dumps({"claim": claim, **record}) + "\n")
+            yield {"type": "exhibit", "record": record, "lines": exhibit_lines(record)}
 
-    lines, trial = _verdict(claim, camera, k, subpoenas, budget, records)
+    used = sum(r["subpoena"] is not None for r in records)
+    lines, trial = _verdict(claim, camera, k, subpoenas, used, records)
     yield {"type": "verdict", "trial": trial, "lines": lines}
 
 
-def run_trial(claim: str, camera: str | None, k: int, subpoenas: int) -> tuple[list[str], dict]:
+def run_trial(
+    claim: str, camera: str | None, k: int, subpoenas: int | None = None, **kwargs: Any
+) -> tuple[list[str], dict]:
     """Try every exhibit search() returns.
 
     Returns ``(transcript_lines, trial)`` where ``trial`` carries the per-exhibit records
@@ -371,7 +431,7 @@ def run_trial(claim: str, camera: str | None, k: int, subpoenas: int) -> tuple[l
     """
     lines: list[str] = []
     trial: dict = {}
-    for event in iter_trial(claim, camera, k, subpoenas):
+    for event in iter_trial(claim, camera, k, subpoenas, **kwargs):
         if event["type"] in ("exhibit", "verdict"):
             lines.extend(event["lines"])
         if event["type"] == "verdict":
@@ -380,7 +440,7 @@ def run_trial(claim: str, camera: str | None, k: int, subpoenas: int) -> tuple[l
 
 
 def _verdict(
-    claim: str, camera: str | None, k: int, subpoenas: int, budget: int, records: list[dict]
+    claim: str, camera: str | None, k: int, subpoenas: int | None, used: int, records: list[dict]
 ) -> tuple[list[str], dict]:
     """Tally the records, hear the bailiff, maybe file the report."""
     lines: list[str] = []
@@ -392,7 +452,10 @@ def _verdict(
     # view says nothing about the claim, so it is excluded from the denominator.
     decided = len(admitted) + struck
     confidence = len(admitted) / decided if decided else 0.0
-    guilty = bool(decided) and confidence >= 0.5
+    pattern = is_pattern_claim(claim)
+    guilty = bool(admitted) and (confidence >= 0.5 if pattern else True)
+    # The same incident filmed from several angles: how many videos independently show it.
+    videos = len({r["segment"].get("video") for r in admitted})
     # The outcome is decided here, not by the bailiff; without it the model can announce
     # "guilty" on a record of zero admitted exhibits.
     outcome = "guilty" if guilty else "not guilty — case dismissed"
@@ -401,13 +464,18 @@ def _verdict(
         BAILIFF,
         f"Claim: {claim}\nExhibits admitted: {len(admitted)}\nExhibits struck: {struck}\n"
         f"Exhibits not reached (subpoena budget exhausted; not counted): {not_reached}\n"
+        f"Kind of claim: {'a pattern' if pattern else 'a single incident'}\n"
         f"Outcome (already decided): {outcome}",
         model=REASONING_MODEL,
     ))
     tally = f"admitted {len(admitted)} · struck {struck}"
     if not_reached:
         tally += f" · not reached {not_reached}"
+    kind = "pattern: most exhibits must be admitted" if pattern else "incident: one admitted exhibit proves it"
     lines.append(f"VERDICT  [{tally} · confidence {confidence:.2f}]")
+    lines.append(f"  STANDARD:    {kind}")
+    if admitted:
+        lines.append(f"  SEEN IN:     {videos} video{'s' if videos != 1 else ''}")
     if struck:
         why = " · ".join(f"{v} {k}" for k, v in breakdown.items() if v)
         lines.append(f"  STRUCK FOR:  {why}")
@@ -418,7 +486,8 @@ def _verdict(
         "camera": camera,
         "k": k,
         "subpoenas": subpoenas,
-        "subpoenas_used": subpoenas - budget,
+        "subpoenas_used": used,
+        "standard": "pattern" if pattern else "incident",
         "exhibits": records,
         "verdict": {
             "admitted": len(admitted),
@@ -427,6 +496,7 @@ def _verdict(
             "struck_for": breakdown,
             "confidence": confidence,
             "guilty": guilty,
+            "videos": videos,
             "bailiff": bailiff,
         },
         "report": None,
@@ -491,12 +561,17 @@ def main() -> None:
     parser.add_argument("--claim", required=True, help="the behavior on trial, in plain language")
     parser.add_argument("--camera", default=None, help="limit the search to one camera")
     parser.add_argument("--k", type=int, default=10, help="number of exhibits to search for")
-    parser.add_argument("--subpoenas", type=int, default=4, help="max clips the court may view")
+    parser.add_argument("--subpoenas", type=int, default=None, help="cap on tapes viewed (default: view every exhibit)")
+    parser.add_argument("--whole-videos", action="store_true",
+                        help="try every segment of every video the search turns up, not just the hits")
+    parser.add_argument("--workers", type=int, default=6, help="exhibits tried concurrently")
     parser.add_argument("--out", default=None, help="also write the transcript here")
     parser.add_argument("--json", default=None, help="write the full trial record (per-exhibit dicts + verdict) here")
     args = parser.parse_args()
 
-    lines, trial = run_trial(args.claim, args.camera, args.k, args.subpoenas)
+    lines, trial = run_trial(
+        args.claim, args.camera, args.k, args.subpoenas, whole_videos=args.whole_videos, workers=args.workers
+    )
     transcript = "\n".join(lines)
     print(transcript)
     if args.out:

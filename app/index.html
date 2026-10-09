@@ -88,7 +88,8 @@
       <input id="claim" placeholder="File a claim about the archive, e.g. “Trucks routinely block the bike lane on this route.”" autocomplete="off">
       <select id="camera"><option value="">any camera</option></select>
       <label class="small">exhibits <input id="k" type="number" min="1" max="30" value="8"></label>
-      <label class="small">subpoenas <input id="subpoenas" type="number" min="0" max="30" value="4"></label>
+      <label class="small" title="cap on tapes the court views; blank = every exhibit">tapes <input id="subpoenas" type="number" min="0" max="100" placeholder="all"></label>
+      <label class="small" title="try every segment of each video the search turns up"><input id="whole" type="checkbox"> whole videos</label>
       <button class="primary" id="file">File the claim</button>
     </div>
     <div class="row">
@@ -178,17 +179,16 @@ function renderExhibit(r) {
     ? line('DEFENSE', '<span class="muted">No objection.</span>')
     : line('DEFENSE', `<span class="obj">objection · ${esc(r.defense.objection)}</span>${esc(r.defense.reason)}`);
   right += line('JUDGE', esc(r.judge.line));
-  if (r.judge.ruling === 'SUBPOENA') {
-    if (r.subpoena) {
-      for (const a of r.subpoena.answers || []) {
-        right += line('THE COURT ASKS', `<span class="q">${esc(a.question)}</span>`);
-        right += line('THE TAPE ANSWERS', `<b>${esc(a.answer)}</b> — ${esc(a.reason)}`);
-      }
-      if ((r.subpoena.answers || []).length > 1 && r.subpoena.answer !== r.subpoena.answers[0].answer)
-        right += line('THE COURT FINDS', `<b>${esc(r.subpoena.answer)}</b> — the answers do not agree.`);
-    } else {
-      right += line('THE COURT', '<span class="muted">declines to view the tape: subpoena budget exhausted; exhibit not reached.</span>');
+  // Every exhibit's tape is viewed (up to the cap); the papers alone never admit.
+  if (r.subpoena) {
+    for (const a of r.subpoena.answers || []) {
+      right += line('THE COURT ASKS', `<span class="q">${esc(a.question)}</span>`);
+      right += line('THE TAPE ANSWERS', `<b>${esc(a.answer)}</b> — ${esc(a.reason)}`);
     }
+    if ((r.subpoena.answers || []).length > 1 && r.subpoena.answer !== r.subpoena.answers[0].answer)
+      right += line('THE COURT FINDS', `<b>${esc(r.subpoena.answer)}</b> — the answers do not agree.`);
+  } else if (r.disposition === 'NOT_REACHED') {
+    right += line('THE COURT', '<span class="muted">declines to view the tape: tape cap reached; exhibit not reached.</span>');
   }
   const why = r.disposition === 'STRIKE' ? (r.struck_for || '') : r.disposition === 'NOT_REACHED' ? 'not counted' : '';
   const stampText = { ADMIT:'Admitted', STRIKE:'Struck', NOT_REACHED:'Not reached' }[r.disposition] || r.disposition;
@@ -219,13 +219,15 @@ function renderVerdict(trial) {
   box.innerHTML = `
     <div class="muted">VERDICT on “${esc(trial.claim)}”${trial.camera ? ' · ' + esc(trial.camera) : ''}</div>
     <div class="big ${v.guilty ? 'bad' : 'ok'}">${v.guilty ? 'GUILTY' : 'NOT GUILTY — case dismissed'}</div>
+    <div class="muted">${trial.standard === 'incident' ? 'Incident: one admitted exhibit proves it.' : 'Pattern: most decided exhibits must be admitted.'}</div>
     <div class="bar"><i class="a" style="width:${100*v.admitted/total}%"></i><i class="s" style="width:${100*v.struck/total}%"></i><i class="n" style="width:${100*v.not_reached/total}%"></i></div>
     <div class="tally">
       <div><b class="ok">${v.admitted}</b>admitted</div>
       <div><b class="bad">${v.struck}</b>struck${why ? ` <span class="muted">(${esc(why)})</span>` : ''}</div>
       ${v.not_reached ? `<div><b class="muted">${v.not_reached}</b>not reached <span class="muted">(budget; not counted)</span></div>` : ''}
       <div><b>${(v.confidence * 100).toFixed(0)}%</b>of decided exhibits admitted</div>
-      <div><b>${trial.subpoenas_used}/${trial.subpoenas}</b>subpoenas used</div>
+      <div><b>${trial.subpoenas_used}/${trial.subpoenas ?? trial.exhibits.length}</b>tapes viewed</div>
+      ${v.admitted ? `<div><b>${v.videos}</b>video${v.videos === 1 ? '' : 's'} show it</div>` : ''}
     </div>
     ${line('BAILIFF', esc(v.bailiff))}
     <div style="margin-top:6px"><b>SENTENCE:</b> ${v.guilty
@@ -277,7 +279,8 @@ $('claimform').addEventListener('submit', async e => {
   $('file').disabled = true;
   try {
     const d = await post('api/trial', { claim: claimText, camera: $('camera').value || null,
-      k: +$('k').value || 8, subpoenas: +$('subpoenas').value || 0 });
+      k: +$('k').value || 8, subpoenas: $('subpoenas').value === '' ? null : +$('subpoenas').value,
+      whole_videos: $('whole').checked });
     attach(d.id);
   } catch (err) { setSession('Could not file the claim: ' + err.message, false); $('file').disabled = false; }
 });

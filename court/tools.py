@@ -131,13 +131,15 @@ def _api(
     body: dict[str, Any] | None = None,
     token_in_query: bool = False,
 ) -> Any:
-    """Call ``/api/v1/<path>`` with the cached JWT; on 401 re-login once and retry.
+    """Call ``/api/v1/<path>`` with the cached JWT; on 401 re-login once and retry, on 502/503/504
+    back off and retry up to three times.
 
     Raises :class:`urllib.error.HTTPError` for non-401 failures so callers can
     treat e.g. 404 as "not available".
     """
-    for attempt in range(2):
-        token = _get_token(refresh=attempt > 0)
+    refreshed = False
+    for attempt in range(4):
+        token = _get_token(refresh=refreshed and attempt > 0)
         query = dict(params or {})
         headers = {"Accept": "application/json"}
         if token_in_query:
@@ -157,8 +159,13 @@ def _api(
                 raw = resp.read()
                 return json.loads(raw) if raw else None
         except urllib.error.HTTPError as exc:
-            if exc.code == 401 and attempt == 0:
+            if exc.code == 401 and not refreshed:
+                refreshed = True
                 continue  # token expired or revoked: refresh and retry once
+            if exc.code in (502, 503, 504) and attempt < 3:
+                # The shared backend drops requests under load; one blip shouldn't sink a 60-exhibit trial.
+                time.sleep(1.5 * (attempt + 1))
+                continue
             raise
     raise RuntimeError("unreachable")  # pragma: no cover
 
@@ -531,6 +538,17 @@ def neighbors(segment_id: str) -> tuple[dict | None, dict | None]:
     if DEMO_MODE:
         return _demo_neighbors(segment_id)
     return _vss_neighbors(segment_id)
+
+
+def segments(video: str) -> list[dict]:
+    """Every segment of one parent ``video``, in order, in the :func:`search` dict shape."""
+    if DEMO_MODE:
+        return [dict(_DEMO_BY_ID[sid]) for sid in _DEMO_ORDER if _DEMO_BY_ID[sid]["video"] == video]
+    listing = _api("GET", "tools/segments", params={"original_video": video}) or {}
+    rows = listing.get("segments") if isinstance(listing, dict) else listing
+    rows = [r for r in (rows or []) if r.get("source")]
+    rows.sort(key=lambda r: (float(r.get("segment_start_sec") or 0.0), int(r.get("segment_number") or 0)))
+    return [_to_segment(r, with_bboxes=True) for r in rows]
 
 
 def look(segment_id: str, question: str) -> dict:
