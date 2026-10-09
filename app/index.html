@@ -158,10 +158,15 @@ function line(who, html) {
   return `<div class="line ${WHO[who] || ''}"><div class="who">${esc(who)}</div><div class="what">${html}</div></div>`;
 }
 
-function yoloChips(yolo, caption) {
+function yoloChips(yolo, detector) {
   const ks = Object.keys(yolo || {});
   if (!ks.length) return '<span class="muted">no detections</span>';
-  return ks.sort((a, b) => yolo[b] - yolo[a]).map(k => `<span title="max per frame">${esc(k)} × ${yolo[k]}</span>`).join('');
+  const seen = (detector && detector.frames_seen) || {}, frames = (detector && detector.frames) || 0;
+  return ks.sort((a, b) => yolo[b] - yolo[a]).map(k => {
+    const n = seen[k], flicker = frames && n != null && n / frames < 0.1;   // seen in <10% of frames: a guess
+    const cov = frames && n != null ? ` <small class="muted">${n}/${frames}f</small>` : '';
+    return `<span class="${flicker ? 'absent' : ''}" title="${esc(k)}: max ${yolo[k]} per frame${frames ? `, seen in ${n ?? 0} of ${frames} frames` : ''}${flicker ? ' — likely a mislabel of an object the detector has no class for' : ''}">${esc(k)} × ${yolo[k]}${cov}</span>`;
+  }).join('') + (detector && detector.model ? `<span class="muted" style="border:0;background:none">${esc(detector.model)} · 80 COCO classes</span>` : '');
 }
 
 function pendingCard(n) {
@@ -175,9 +180,15 @@ function renderExhibit(r) {
   const el = $('ex' + r.n) || pendingCard(r.n);
   el.className = 'exhibit panel';
   let right = line('PROSECUTION', esc(r.prosecution));
-  right += r.defense.objection === 'none'
-    ? line('DEFENSE', '<span class="muted">No objection.</span>')
-    : line('DEFENSE', `<span class="obj">objection · ${esc(r.defense.objection)}</span>${esc(r.defense.reason)}`);
+  if (r.defense.withdrawn) {
+    const w = r.defense.withdrawn;
+    right += line('DEFENSE', `<span class="obj" style="text-decoration:line-through;opacity:.6">objection · ${esc(w.objection)}</span><s style="opacity:.6">${esc(w.reason)}</s>`);
+    right += line('THE COURT', esc(r.defense.reason));
+  } else if (r.defense.objection === 'none') {
+    right += line('DEFENSE', '<span class="muted">No objection.</span>');
+  } else {
+    right += line('DEFENSE', `<span class="obj">objection · ${esc(r.defense.objection)}</span>${esc(r.defense.reason)}`);
+  }
   right += line('JUDGE', esc(r.judge.line));
   // Every exhibit's tape is viewed (up to the cap); the papers alone never admit.
   if (r.subpoena) {
@@ -187,6 +198,8 @@ function renderExhibit(r) {
     }
     if ((r.subpoena.answers || []).length > 1 && r.subpoena.answer !== r.subpoena.answers[0].answer)
       right += line('THE COURT FINDS', `<b>${esc(r.subpoena.answer)}</b> — the answers do not agree.`);
+    if (r.shared_witness)
+      right += line('THE COURT', `<span class="muted">notes that the tape witness (${esc(r.subpoena.witness)}) is the model that wrote the caption; their agreement is one witness heard twice, not corroboration.</span>`);
   } else if (r.disposition === 'NOT_REACHED') {
     right += line('THE COURT', '<span class="muted">declines to view the tape: tape cap reached; exhibit not reached.</span>');
   }
@@ -201,7 +214,7 @@ function renderExhibit(r) {
       <h3>Exhibit ${r.n}</h3>
       <video controls preload="metadata" src="${clipUrl(seg.id)}"></video>
       <div class="muted" style="margin-top:6px">${where}</div>
-      <div class="yolo">${yoloChips(seg.yolo, seg.caption)}</div>
+      <div class="yolo">${yoloChips(seg.yolo, seg.detector)}</div>
       <details class="cap"><summary>Caption (hearsay)</summary><p>${esc(seg.caption)}</p></details>
       ${nbHtml}
     </div>

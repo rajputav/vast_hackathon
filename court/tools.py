@@ -213,6 +213,14 @@ def _cosmos_headers() -> dict[str, str]:
     }
 
 
+def witness_model() -> str | None:
+    """Model id that answers :func:`look` (or None if not resolvable); never raises."""
+    try:
+        return _cosmos_model_id(timeout=10.0)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _cosmos_model_id(timeout: float) -> str:
     """Model id from env/config, else discovered once via ``GET /v1/models``."""
     global _cosmos_model
@@ -324,23 +332,40 @@ def _yolo_counts(hit: dict[str, Any]) -> dict[str, int]:
     return out
 
 
-def _bboxes(hit: dict[str, Any]) -> list[dict[str, Any]]:
-    """Per-object boxes for the segment's densest frame, from the YOLO sidecar.
+_NO_DETECTOR: dict[str, Any] = {"model": None, "frames": 0, "frames_seen": {}}
 
-    Returns ``[]`` when there is no sidecar (404) or the request fails; bboxes are
-    best-effort and must never break a search.
+
+def _detections(hit: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """``(bboxes, detector)`` from the YOLO sidecar.
+
+    ``bboxes`` are the boxes of the segment's densest frame (object_counts are "max per
+    frame", so that frame matches them). ``detector`` summarises coverage: the detector
+    model, how many frames it ran on, and in how many frames each class was seen — so a
+    court can tell "seen in 3 of 150 frames as 'boat'" from "seen throughout". Both are
+    best-effort: no sidecar (404) or any failure yields ``([], _NO_DETECTOR)``.
     """
     source = hit.get("source")
     if not source:
-        return []
+        return [], dict(_NO_DETECTOR)
     try:
         sidecar = _api("GET", "videos/detections", params={"source": source})
     except (urllib.error.URLError, RuntimeError, ValueError):
-        return []
+        return [], dict(_NO_DETECTOR)
     frames = (sidecar or {}).get("frames") or []
     if not frames:
-        return []
-    # object_counts are "max per frame"; the frame with the most detections matches them.
+        return [], dict(_NO_DETECTOR)
+
+    frames_seen: dict[str, int] = {}
+    for f in frames:
+        for cls in {d.get("label") or d.get("class") for d in (f.get("detections") or [])}:
+            if cls:
+                frames_seen[cls] = frames_seen.get(cls, 0) + 1
+    detector = {
+        "model": (sidecar or {}).get("source"),  # e.g. "yolo11_coco"
+        "frames": len(frames),
+        "frames_seen": dict(sorted(frames_seen.items(), key=lambda kv: -kv[1])),
+    }
+
     best = max(frames, key=lambda f: len(f.get("detections") or []))
     boxes: list[dict[str, Any]] = []
     for det in best.get("detections") or []:
@@ -354,18 +379,28 @@ def _bboxes(hit: dict[str, Any]) -> list[dict[str, Any]]:
                 "xyxy": [float(v) for v in bbox],
             }
         )
-    return boxes
+    return boxes, detector
+
+
+def _bboxes(hit: dict[str, Any]) -> list[dict[str, Any]]:
+    """Per-object boxes for the segment's densest frame (see :func:`_detections`)."""
+    return _detections(hit)[0]
 
 
 def _to_segment(hit: dict[str, Any], *, with_bboxes: bool) -> dict[str, Any]:
     source = hit.get("source") or ""
+    bboxes, detector = _detections(hit) if with_bboxes else ([], dict(_NO_DETECTOR))
     return {
         "id": source or hit.get("filename") or "",
         "video": hit.get("original_video") or source,
         "ts": float(hit.get("segment_start_sec") or 0.0),
         "caption": (hit.get("reasoning_content") or "").strip(),
+        # The model that wrote the caption. look() calls the same endpoint, so a court should
+        # know when its tape witness is also its stenographer.
+        "captioner": hit.get("cosmos_model"),
         "yolo": _yolo_counts(hit),
-        "bboxes": _bboxes(hit) if with_bboxes else [],
+        "bboxes": bboxes,
+        "detector": detector,
         "playback_url": _playback_url(source) if source else "",
     }
 

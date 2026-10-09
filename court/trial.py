@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from court.llm import chat
-from court.tools import look, neighbors, search, segments
+from court.tools import look, neighbors, search, segments, witness_model
 
 COURT_DIR = Path(__file__).parent
 # Where the ledger and hazard reports go. In the pod the code is a read-only ConfigMap
@@ -103,9 +103,12 @@ JUDGE = (
     "the caption never asserts the required state or action at all, or the detections contradict the actor. "
     "SUBPOENA when the papers cannot settle it either way.\n\n"
     "Whatever your ruling, always write two yes/no questions for a model that sees only the pixels of a 5-second clip "
-    "(it has not read the caption or the claim). 'question' decides the open element; 'foundation' checks the "
-    "premise that question takes for granted — that the place, marking or object it refers to is actually "
-    "visible (e.g. 'Is a painted or signed bike lane visible on this street?'). Both must be neutral: ask about "
+    "(it has not read the caption or the claim). 'question' decides the open element: it must ask whether the "
+    "claim's action or state itself happens in the clip (e.g. 'Does the forklift make physical contact with a "
+    "person?', 'Is a motor vehicle stopped inside the painted bike lane?') — never merely whether an object or "
+    "place is present, and never a question about the defense's objection. 'foundation' checks the premise that "
+    "question takes for granted — that the place, marking or object it refers to is actually visible (e.g. 'Is a "
+    "forklift visible?', 'Is a painted or signed bike lane visible on this street?'). Both must be neutral: ask about "
     "visible markings, signs and positions; do not presuppose the answer; do not accept the camera's own "
     "vehicle or equipment as evidence of anything. The exhibit is admitted only if both answers are yes.\n\n"
     "Return only JSON: {\"ruling\": \"ADMIT|STRIKE|SUBPOENA\", \"question\": \"...\", \"foundation\": \"...\", "
@@ -185,21 +188,56 @@ def prosecute(claim: str, segment: dict) -> str:
     return _clean(chat(PROSECUTOR, f"Claim: {claim}\nCaption: {segment['caption']}"))
 
 
+_COCO_SET = frozenset(COCO_CLASSES)
+
+
+def _coco_classes_in(text: str) -> set[str]:
+    """COCO class names mentioned in free text (handles plurals and two-word classes)."""
+    low = " " + re.sub(r"[^a-z ]", " ", text.lower()) + " "
+    return {c for c in _COCO_SET if f" {c} " in low or f" {c}s " in low or f" {c}es " in low}
+
+
+def _vet_object_objection(objection: dict, segment: dict) -> dict:
+    """Deterministic guard: an 'object' objection stands only if it names a COCO class the detector
+    did not see. The detector cannot see a forklift, so "yolo has no forklift, only a boat" is not an
+    objection — it is the detector guessing at an object it has no word for. Downgrade such
+    objections rather than trust the model to remember the vocabulary."""
+    if objection["objection"] != "object":
+        return objection
+    yolo = segment.get("yolo", {})
+    named = _coco_classes_in(objection["reason"])
+    if any(c not in yolo for c in named):
+        return objection  # a real COCO actor is missing: the objection has evidence behind it
+    seen = segment.get("detector", {}).get("frames_seen") or {}
+    frames = segment.get("detector", {}).get("frames") or 0
+    guess = ", ".join(f"'{c}' in {n}/{frames} frames" for c, n in seen.items() if c != "person") or "nothing"
+    return {
+        "objection": "none",
+        "reason": (
+            "Object objection withdrawn by the court: the detector has no class for the caption's actor, so "
+            f"its absence is no evidence; the detector guessed {guess}."
+        ),
+        "withdrawn": {"objection": "object", "reason": objection["reason"]},
+    }
+
+
 def defend(claim: str, segment: dict, prev: dict | None, nxt: dict | None) -> dict:
     evidence = {
         "claim": claim,
         "caption": segment["caption"],
         "yolo": segment.get("yolo", {}),
         "bboxes": segment.get("bboxes", []),
+        # Coverage lets the defense tell "seen throughout" from "seen in 3 of 150 frames as 'boat'".
+        "detector": segment.get("detector"),
         "previous_segment": _neighbor_view(prev),
         "next_segment": _neighbor_view(nxt),
     }
     result = chat(DEFENSE, json.dumps(evidence, indent=2), json_schema=DEFENSE_SCHEMA, model=REASONING_MODEL)
     objection = str(result.get("objection", "none")).lower()
-    return {
+    return _vet_object_objection({
         "objection": objection if objection in OBJECTIONS else "none",
         "reason": _clean(result.get("reason", "")),
-    }
+    }, segment)
 
 
 def rule(claim: str, segment: dict, objection: dict) -> dict:
@@ -254,6 +292,7 @@ def view_tape(segment_id: str, question: str, foundation: str) -> dict:
         "answer": verdict,
         "reason": main["reason"],
         "answers": answers,
+        "witness": witness_model(),
         "seconds": round(time.monotonic() - t0, 2),
     }
 
@@ -315,6 +354,13 @@ def try_exhibit(claim: str, n: int, segment: dict, camera: str | None, may_view:
         disposition = "STRIKE"
         struck_for = "unclear" if subpoena["answer"] == "unclear" else "tape"
 
+    # The tape witness is the Cosmos endpoint; the caption came from a Cosmos model too. When they
+    # are the same model, the tape agreeing with the caption is the same witness twice, not
+    # corroboration. Recorded so the transcript and UI can say so.
+    witness = (subpoena or {}).get("witness")
+    captioner = segment.get("captioner")
+    shared_witness = bool(witness and captioner and _same_model(witness, captioner))
+
     return {
         "n": n,
         "camera": camera,
@@ -325,9 +371,16 @@ def try_exhibit(claim: str, n: int, segment: dict, camera: str | None, may_view:
         "defense": defense,
         "judge": judge,
         "subpoena": subpoena,
+        "shared_witness": shared_witness,
         "disposition": disposition,
         "struck_for": struck_for,
     }
+
+
+def _same_model(a: str, b: str) -> bool:
+    """'nvidia/cosmos3-nano-reasoner' vs 'cosmos3-nano-reasoner' → same."""
+    norm = lambda s: s.lower().rsplit("/", 1)[-1]  # noqa: E731
+    return norm(a) == norm(b)
 
 
 def exhibit_lines(record: dict) -> list[str]:
@@ -340,7 +393,11 @@ def exhibit_lines(record: dict) -> list[str]:
         f"  PROSECUTION: {record['prosecution']}",
     ]
     defense = record["defense"]
-    if defense["objection"] == "none":
+    if defense.get("withdrawn"):
+        w = defense["withdrawn"]
+        lines.append(f"  DEFENSE:     Objection ({w['objection']}). {w['reason']}")
+        lines.append(f"  THE COURT:   {defense['reason']}")
+    elif defense["objection"] == "none":
         lines.append("  DEFENSE:     No objection.")
     else:
         lines.append(f"  DEFENSE:     Objection ({defense['objection']}). {defense['reason']}")
@@ -353,6 +410,9 @@ def exhibit_lines(record: dict) -> list[str]:
             lines.append(f"  THE TAPE ANSWERS: {a['answer']} — {reason}")
         if len(sub["answers"]) > 1 and sub["answer"] != sub["answers"][0]["answer"]:
             lines.append(f"  THE COURT FINDS: {sub['answer']} — the answers do not agree.")
+        if record.get("shared_witness"):
+            lines.append(f"  THE COURT NOTES: the tape witness ({sub.get('witness')}) is the model that wrote "
+                         "the caption; their agreement is one witness heard twice, not corroboration.")
     elif record["disposition"] == "NOT_REACHED":
         lines.append("  THE COURT DECLINES TO VIEW THE TAPE: subpoena budget exhausted; exhibit not reached.")
     lines.append(f"  RULING:      {record['disposition']}"
