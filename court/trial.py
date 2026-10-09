@@ -67,7 +67,11 @@ DEFENSE = (
     "against the detections.\n\n"
     "How to read the evidence: 'yolo' is the maximum count per class seen in any frame of this 5-second "
     "segment and is the authoritative detection record. 'bboxes' are boxes from one representative frame, so a "
-    "class present in 'yolo' but missing from 'bboxes' is NOT a contradiction. 'previous_segment' and "
+    "class present in 'yolo' but missing from 'bboxes' is NOT a contradiction. 'detector.frames_seen' is how "
+    "many of the segment's frames each class appeared in; a class seen in a handful of frames is a flicker. "
+    "'physical_evidence', when present, is the tracked person's speed from a fixed camera: an abrupt spike "
+    "mid-clip is consistent with being struck, a steady speed with walking or pushing — cite it when it "
+    "bears on a contact or motion element. 'previous_segment' and "
     "'next_segment' are the adjacent 5-second segments of the same video.\n\n"
     "The detector is YOLO trained on the 80 COCO classes: " + ", ".join(COCO_CLASSES) + ". It cannot see "
     "anything else — a forklift, pallet jack, scooter, cart or shelving rack is never in 'yolo' even when it "
@@ -93,8 +97,10 @@ DEFENSE = (
 )
 
 JUDGE = (
-    "You are the judge. You rule on one exhibit given the claim, the caption, the detections, and the "
-    "defense's objection. This is a ruling on the papers only: the court then views the tape of every "
+    "You are the judge. You rule on one exhibit given the claim, the caption, the detections, the "
+    "defense's objection and, when a fixed camera allows it, 'physical_evidence': the detector's own track of the "
+    "person's speed (an abrupt mid-clip spike is consistent with being struck; a steady speed with walking or "
+    "pushing). It is independent of the caption and the tape; weigh it. This is a ruling on the papers only: the court then views the tape of every "
     "exhibit, and nothing is admitted unless the tape shows it. ADMIT only if the caption asserts what the claim requires, the detections corroborate "
     "it, and no valid objection stands. Overrule and ADMIT when the objection is contradicted by the record "
     "(an 'object' objection where 'yolo' contains the class; a 'scope' objection where the caption plainly "
@@ -221,6 +227,37 @@ def _vet_object_objection(objection: dict, segment: dict) -> dict:
     }
 
 
+def physical_evidence(segment: dict) -> dict | None:
+    """What the detector's own boxes say about the person's motion — the one witness in this
+    court that is neither the captioner nor the tape. Only from a fixed camera."""
+    motion = (segment.get("detector") or {}).get("motion")
+    if not motion or not motion.get("admissible"):
+        return None
+    return {
+        "person_speed_median_px_s": motion["median_px_s"],
+        "person_speed_peak_px_s": motion.get("peak_px_s"),
+        "peak_at_sec": motion.get("peak_t"),
+        "spike_ratio": motion.get("spike_ratio"),
+        "abrupt_change": bool(motion.get("abrupt")),
+        "stationary": motion.get("spike_ratio") is None,
+        "note": "an abrupt speed change (ratio >= 2.5 mid-clip) is consistent with the person being struck; "
+                "a steady speed is consistent with walking, pushing or riding",
+    }
+
+
+def physical_line(segment: dict) -> str | None:
+    pe = physical_evidence(segment)
+    if pe is None:
+        return None
+    if pe["stationary"]:
+        return (f"the detector tracks the person at {pe['person_speed_median_px_s']} px/s — standing still; "
+                "no abrupt change.")
+    verb = "jumps" if pe["abrupt_change"] else "holds"
+    tail = "an abrupt change consistent with contact." if pe["abrupt_change"] else "no abrupt change."
+    return (f"the detector tracks the person at {pe['person_speed_median_px_s']} px/s; speed {verb} to "
+            f"{pe['person_speed_peak_px_s']} px/s (×{pe['spike_ratio']}) at {pe['peak_at_sec']}s — {tail}")
+
+
 def defend(claim: str, segment: dict, prev: dict | None, nxt: dict | None) -> dict:
     evidence = {
         "claim": claim,
@@ -228,7 +265,8 @@ def defend(claim: str, segment: dict, prev: dict | None, nxt: dict | None) -> di
         "yolo": segment.get("yolo", {}),
         "bboxes": segment.get("bboxes", []),
         # Coverage lets the defense tell "seen throughout" from "seen in 3 of 150 frames as 'boat'".
-        "detector": segment.get("detector"),
+        "detector": {k: v for k, v in (segment.get("detector") or {}).items() if k != "motion"},
+        "physical_evidence": physical_evidence(segment),
         "previous_segment": _neighbor_view(prev),
         "next_segment": _neighbor_view(nxt),
     }
@@ -245,6 +283,7 @@ def rule(claim: str, segment: dict, objection: dict) -> dict:
         "claim": claim,
         "caption": segment["caption"],
         "yolo": segment.get("yolo", {}),
+        "physical_evidence": physical_evidence(segment),
         "objection": objection,
     }
     result = chat(JUDGE, json.dumps(evidence, indent=2), json_schema=JUDGE_SCHEMA, model=REASONING_MODEL)
@@ -369,6 +408,7 @@ def try_exhibit(claim: str, n: int, segment: dict, camera: str | None, may_view:
         "neighbors": {"prev": _neighbor_record(prev), "next": _neighbor_record(nxt)},
         "prosecution": prosecution,
         "defense": defense,
+        "physical": physical_evidence(segment),
         "judge": judge,
         "subpoena": subpoena,
         "shared_witness": shared_witness,
@@ -401,6 +441,9 @@ def exhibit_lines(record: dict) -> list[str]:
         lines.append("  DEFENSE:     No objection.")
     else:
         lines.append(f"  DEFENSE:     Objection ({defense['objection']}). {defense['reason']}")
+    physical = physical_line(record["segment"])
+    if physical:
+        lines.append(f"  THE RECORD:  {physical}")
     lines.append(f"  JUDGE:       {record['judge']['line']}")
     if record["subpoena"]:
         sub = record["subpoena"]

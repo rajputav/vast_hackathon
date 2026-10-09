@@ -366,6 +366,16 @@ def _detections(hit: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, An
         "frames_seen": dict(sorted(frames_seen.items(), key=lambda kv: -kv[1])),
     }
 
+    motion = _person_motion(frames, float((sidecar or {}).get("fps") or 30.0))
+    if motion is not None:
+        # Pixel speed from a camera that is itself moving measures the camera, not the person.
+        moving = bool(_MOVING_CAMERA.search(str(hit.get("camera_id") or "")))
+        motion["admissible"] = not moving
+        if moving:
+            motion["inadmissible_because"] = "moving camera"
+            motion["abrupt"] = False
+    detector["motion"] = motion
+
     best = max(frames, key=lambda f: len(f.get("detections") or []))
     boxes: list[dict[str, Any]] = []
     for det in best.get("detections") or []:
@@ -380,6 +390,72 @@ def _detections(hit: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, An
             }
         )
     return boxes, detector
+
+
+_MOVING_CAMERA = re.compile(r"gopro|dash|body|helmet|bike|handheld|mobile|drone", re.IGNORECASE)
+_MOTION_EDGE_S = 0.3        # ignore the first/last 0.3 s: tracks start and end with jitter
+_MOTION_MIN_TRACK = 0.5     # the person must be tracked in at least half the frames
+_MOTION_MIN_MEDIAN = 40.0   # px/s; below this the person is standing and any ratio is noise
+_MOTION_SPIKE = 2.5         # peak / median at which we call it an abrupt change
+
+
+def _person_motion(frames: list[dict[str, Any]], fps: float) -> dict[str, Any] | None:
+    """Kinematics of the longest-tracked person, from per-frame YOLO boxes.
+
+    A person struck by something changes speed abruptly; one walking or pushing does not.
+    Centroids are linked greedily frame to frame, speeds smoothed over five samples, and the
+    peak compared with the median. Pixel speeds only mean anything from a fixed camera; the
+    court is told the ratio and the moment, and weighs it. None when nobody is tracked.
+    """
+    tracks: list[list[tuple[float, float, float]]] = []
+    for i, f in enumerate(frames):
+        t = float(f.get("time_sec") if f.get("time_sec") is not None else i / fps)
+        cents = [
+            ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
+            for d in (f.get("detections") or [])
+            if (d.get("label") or d.get("class")) == "person"
+            for b in [d.get("bbox") or d.get("xyxy") or []]
+            if len(b) == 4
+        ]
+        used: set[int] = set()
+        for tr in tracks:
+            lt, lx, ly = tr[-1]
+            if t - lt > 0.5:
+                continue
+            cands = [(j, ((cx - lx) ** 2 + (cy - ly) ** 2) ** 0.5) for j, (cx, cy) in enumerate(cents) if j not in used]
+            if not cands:
+                break
+            j, dist = min(cands, key=lambda c: c[1])
+            if dist < 120:
+                tr.append((t, *cents[j]))
+                used.add(j)
+        tracks.extend([(t, *c)] for j, c in enumerate(cents) if j not in used)
+    if not tracks:
+        return None
+    tr = max(tracks, key=len)
+    if len(tr) < _MOTION_MIN_TRACK * len(frames) or len(tr) < 10:
+        return None
+    speeds = [
+        ((((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5) / (t2 - t1), t2)
+        for (t1, x1, y1), (t2, x2, y2) in zip(tr, tr[1:])
+        if t2 > t1
+    ]
+    v = [s for s, _ in speeds]
+    smooth = [sum(v[max(0, i - 2): i + 3]) / len(v[max(0, i - 2): i + 3]) for i in range(len(v))]
+    median = sorted(smooth)[len(smooth) // 2]
+    end = tr[-1][0]
+    mid = [i for i, (_, t) in enumerate(speeds) if _MOTION_EDGE_S <= t <= end - _MOTION_EDGE_S]
+    if not mid or median < _MOTION_MIN_MEDIAN:
+        return {"tracked_frames": len(tr), "median_px_s": round(median), "peak_px_s": None, "peak_t": None, "spike_ratio": None}
+    pk = max(mid, key=lambda i: smooth[i])
+    return {
+        "tracked_frames": len(tr),
+        "median_px_s": round(median),
+        "peak_px_s": round(smooth[pk]),
+        "peak_t": round(speeds[pk][1], 2),
+        "spike_ratio": round(smooth[pk] / median, 2),
+        "abrupt": smooth[pk] / median >= _MOTION_SPIKE,
+    }
 
 
 def _bboxes(hit: dict[str, Any]) -> list[dict[str, Any]]:
@@ -398,6 +474,7 @@ def _to_segment(hit: dict[str, Any], *, with_bboxes: bool) -> dict[str, Any]:
         # The model that wrote the caption. look() calls the same endpoint, so a court should
         # know when its tape witness is also its stenographer.
         "captioner": hit.get("cosmos_model"),
+        "camera": hit.get("camera_id"),
         "yolo": _yolo_counts(hit),
         "bboxes": bboxes,
         "detector": detector,

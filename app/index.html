@@ -46,6 +46,7 @@
   .yolo { display:flex; flex-wrap:wrap; gap:4px; margin-top:8px; }
   .yolo span { font-size:11px; padding:2px 7px; border-radius:4px; background:#10141a; border:1px solid var(--line); color:#c9d1d9; }
   .yolo span.absent { border-style:dashed; color:var(--bad); }
+  .yolo span.spike { border-color:var(--good, #3fb950); color:var(--good, #3fb950); }
   .cap { margin-top:8px; font-size:12px; color:#c9d1d9; }
   .cap summary { cursor:pointer; color:var(--muted); }
   .cap p { margin:6px 0 0; white-space:pre-wrap; }
@@ -151,7 +152,7 @@ for (const [c, cam] of SAMPLES) {
 }
 
 // ---- courtroom ---------------------------------------------------------------------------
-const WHO = { PROSECUTION:'pros', DEFENSE:'def', JUDGE:'judge', 'THE COURT ASKS':'tape', 'THE TAPE ANSWERS':'tape', 'THE COURT FINDS':'finds', 'THE COURT':'finds' };
+const WHO = { PROSECUTION:'pros', DEFENSE:'def', JUDGE:'judge', 'THE COURT ASKS':'tape', 'THE TAPE ANSWERS':'tape', 'THE COURT FINDS':'finds', 'THE COURT':'finds', 'THE RECORD':'finds' };
 let es = null, lines = [], rendered = new Set(), docket = 0, claimText = '';
 
 function line(who, html) {
@@ -166,7 +167,14 @@ function yoloChips(yolo, detector) {
     const n = seen[k], flicker = frames && n != null && n / frames < 0.1;   // seen in <10% of frames: a guess
     const cov = frames && n != null ? ` <small class="muted">${n}/${frames}f</small>` : '';
     return `<span class="${flicker ? 'absent' : ''}" title="${esc(k)}: max ${yolo[k]} per frame${frames ? `, seen in ${n ?? 0} of ${frames} frames` : ''}${flicker ? ' — likely a mislabel of an object the detector has no class for' : ''}">${esc(k)} × ${yolo[k]}${cov}</span>`;
-  }).join('') + (detector && detector.model ? `<span class="muted" style="border:0;background:none">${esc(detector.model)} · 80 COCO classes</span>` : '');
+  }).join('') + motionChip(detector && detector.motion) + (detector && detector.model ? `<span class="muted" style="border:0;background:none">${esc(detector.model)} · 80 COCO classes</span>` : '');
+}
+
+function motionChip(m) {
+  if (!m) return '';
+  if (!m.admissible) return `<span class="muted" title="pixel speed from a moving camera measures the camera, not the person">motion: n/a (${esc(m.inadmissible_because || 'moving camera')})</span>`;
+  if (m.spike_ratio == null) return `<span title="person tracked in ${m.tracked_frames} frames, median ${m.median_px_s} px/s">person: standing</span>`;
+  return `<span class="${m.abrupt ? 'spike' : ''}" title="person speed ${m.median_px_s} → ${m.peak_px_s} px/s at ${m.peak_t}s">person speed ×${m.spike_ratio} @ ${m.peak_t}s${m.abrupt ? ' · spike' : ''}</span>`;
 }
 
 function pendingCard(n) {
@@ -188,6 +196,13 @@ function renderExhibit(r) {
     right += line('DEFENSE', '<span class="muted">No objection.</span>');
   } else {
     right += line('DEFENSE', `<span class="obj">objection · ${esc(r.defense.objection)}</span>${esc(r.defense.reason)}`);
+  }
+  const pe = r.physical;
+  if (pe && pe.stationary) {
+    right += line('THE RECORD', `the detector tracks the person at ${pe.person_speed_median_px_s} px/s — standing still; no abrupt change.`);
+  } else if (pe) {
+    const verb = pe.abrupt_change ? 'jumps' : 'holds', tail = pe.abrupt_change ? '<b>an abrupt change consistent with contact.</b>' : 'no abrupt change.';
+    right += line('THE RECORD', `the detector tracks the person at ${pe.person_speed_median_px_s} px/s; speed ${verb} to ${pe.person_speed_peak_px_s} px/s (×${pe.spike_ratio}) at ${pe.peak_at_sec}s — ${tail}`);
   }
   right += line('JUDGE', esc(r.judge.line));
   // Every exhibit's tape is viewed (up to the cap); the papers alone never admit.
