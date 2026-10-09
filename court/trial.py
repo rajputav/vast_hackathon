@@ -79,8 +79,14 @@ JUDGE = (
     "the caption never asserts the required state or action at all, or the detections contradict the actor. "
     "Subpoenas are scarce: SUBPOENA only when the caption asserts the actor AND the state and the sole open "
     "question is the place — for example the caption says 'parked, partially blocking the lane' and the question "
-    "is whether that lane is the bike lane — and write one yes/no question that a model watching the clip could "
-    "answer to decide it. Return only JSON: {\"ruling\": \"ADMIT|STRIKE|SUBPOENA\", \"question\": \"...\", "
+    "is whether that lane is the bike lane.\n\n"
+    "When you SUBPOENA, write two yes/no questions for a model that sees only the pixels of a 5-second clip "
+    "(it has not read the caption or the claim). 'question' decides the open element; 'foundation' checks the "
+    "premise that question takes for granted — that the place, marking or object it refers to is actually "
+    "visible (e.g. 'Is a painted or signed bike lane visible on this street?'). Both must be neutral: ask about "
+    "visible markings, signs and positions; do not presuppose the answer; do not accept the camera's own "
+    "vehicle or equipment as evidence of anything. The exhibit is admitted only if both answers are yes.\n\n"
+    "Return only JSON: {\"ruling\": \"ADMIT|STRIKE|SUBPOENA\", \"question\": \"...\", \"foundation\": \"...\", "
     "\"line\": \"one dry, formal, slightly theatrical sentence announcing the ruling\"}."
 )
 
@@ -102,12 +108,14 @@ JUDGE_SCHEMA = {
     "properties": {
         "ruling": {"enum": list(RULINGS)},
         "question": {"type": "string"},
+        "foundation": {"type": "string"},
         "line": {"type": "string"},
     },
-    "required": ["ruling", "question", "line"],
+    "required": ["ruling", "question", "foundation", "line"],
 }
 
 LOOK_TO_RULING = {"yes": "ADMIT", "no": "STRIKE", "unclear": "STRIKE"}
+ANSWERS = ("yes", "no", "unclear")
 
 
 def _neighbor_view(segment: dict | None) -> dict | None:
@@ -173,7 +181,48 @@ def rule(claim: str, segment: dict, objection: dict) -> dict:
     question = _clean(result.get("question", ""))
     if ruling == "SUBPOENA" and not question:
         question = f"Does this clip show the following: {claim}?"
-    return {"ruling": ruling, "question": question, "line": _clean(result.get("line", ""))}
+    return {
+        "ruling": ruling,
+        "question": question,
+        "foundation": _clean(result.get("foundation", "")),
+        "line": _clean(result.get("line", "")),
+    }
+
+
+def view_tape(segment_id: str, question: str, foundation: str) -> dict:
+    """Put the judge's questions to the clip; both must be answered yes to admit.
+
+    Two independent framings have to agree before one 5-second clip decides an exhibit —
+    a single leading question ("is the truck in the bike lane?") was being answered yes on
+    the strength of the rider's own handlebars. Returns the subpoena record.
+    """
+    t0 = time.monotonic()
+    answers: list[dict] = []
+    for q in (question, foundation):
+        if not q:
+            continue
+        viewed = look(segment_id, q)
+        answer = str(viewed.get("answer", "unclear")).lower()
+        answers.append({
+            "question": q,
+            "answer": answer if answer in ANSWERS else "unclear",
+            "reason": _clean(viewed.get("reason", "")),
+        })
+    got = [a["answer"] for a in answers]
+    if got and all(a == "yes" for a in got):
+        verdict = "yes"
+    elif "no" in got:
+        verdict = "no"
+    else:  # unclear, or no questions at all
+        verdict = "unclear"
+    main = answers[0] if answers else {"question": question, "answer": "unclear", "reason": "no question"}
+    return {
+        "question": main["question"],
+        "answer": verdict,
+        "reason": main["reason"],
+        "answers": answers,
+        "seconds": round(time.monotonic() - t0, 2),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -219,20 +268,10 @@ def try_exhibit(claim: str, n: int, segment: dict, camera: str | None, budget: i
     if disposition == "SUBPOENA":
         if budget > 0:
             budget -= 1
-            t0 = time.monotonic()
-            viewed = look(segment["id"], judge["question"])
-            answer = str(viewed.get("answer", "unclear")).lower()
-            if answer not in LOOK_TO_RULING:
-                answer = "unclear"
-            subpoena = {
-                "question": judge["question"],
-                "answer": answer,
-                "reason": _clean(viewed.get("reason", "")),
-                "seconds": round(time.monotonic() - t0, 2),
-            }
-            disposition = LOOK_TO_RULING[answer]
+            subpoena = view_tape(segment["id"], judge["question"], judge["foundation"])
+            disposition = LOOK_TO_RULING[subpoena["answer"]]
             if disposition == "STRIKE":
-                struck_for = "unclear" if answer == "unclear" else "tape"
+                struck_for = "unclear" if subpoena["answer"] == "unclear" else "tape"
         else:
             disposition = "STRIKE"
             struck_for = "budget"
@@ -273,8 +312,11 @@ def exhibit_lines(record: dict) -> list[str]:
     if record["judge"]["ruling"] == "SUBPOENA":
         if record["subpoena"]:
             sub = record["subpoena"]
-            lines.append(f"  THE COURT ASKS: {sub['question']}")
-            lines.append(f"  THE COURT VIEWS THE TAPE: {sub['answer']} — {sub['reason']}")
+            for a in sub["answers"]:
+                lines.append(f"  THE COURT ASKS: {a['question']}")
+                lines.append(f"  THE TAPE ANSWERS: {a['answer']} — {a['reason']}")
+            if len(sub["answers"]) > 1 and sub["answer"] != sub["answers"][0]["answer"]:
+                lines.append(f"  THE COURT FINDS: {sub['answer']} — the answers do not agree.")
         else:
             lines.append("  THE COURT DECLINES TO VIEW THE TAPE: subpoena budget exhausted; exhibit struck.")
     lines.append("")
