@@ -1,4 +1,7 @@
-"""Court retrieval tools — ``search`` is wired to the VSS retrieval API; the rest are demo stubs."""
+"""Court retrieval tools — ``search``/``neighbors`` on the VSS retrieval API, ``look`` on Cosmos3-Reason.
+
+Set ``COURT_DEMO=1`` to use the hand-written fixtures instead of the live stack.
+"""
 
 from __future__ import annotations
 
@@ -382,6 +385,35 @@ def _vss_search(
     return [_to_segment(h, with_bboxes=with_bboxes) for h in hits[: body["top_k"]]]
 
 
+def _vss_neighbors(segment_id: str, *, with_bboxes: bool = True) -> tuple[dict | None, dict | None]:
+    """(prev, next) by ``segment_start_sec`` within the segment's parent video.
+
+    Resolves the parent via ``GET /videos/metadata?source=`` and lists its
+    segments via ``GET /tools/segments?original_video=``. Unknown ids → (None, None).
+    """
+    if not segment_id.startswith("s3://"):
+        return None, None
+    try:
+        meta = _api("GET", "videos/metadata", params={"source": segment_id}) or {}
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None, None
+        raise
+    parent = meta.get("original_video")
+    if not parent:
+        return None, None
+    listing = _api("GET", "tools/segments", params={"original_video": parent}) or {}
+    rows = listing.get("segments") if isinstance(listing, dict) else listing
+    rows = [r for r in (rows or []) if r.get("source")]
+    rows.sort(key=lambda r: (float(r.get("segment_start_sec") or 0.0), int(r.get("segment_number") or 0)))
+    idx = next((i for i, r in enumerate(rows) if r["source"] == segment_id), None)
+    if idx is None:
+        return None, None
+    prev = _to_segment(rows[idx - 1], with_bboxes=with_bboxes) if idx > 0 else None
+    nxt = _to_segment(rows[idx + 1], with_bboxes=with_bboxes) if idx < len(rows) - 1 else None
+    return prev, nxt
+
+
 # ---------------------------------------------------------------------------
 # Demo fixtures
 # ---------------------------------------------------------------------------
@@ -493,12 +525,12 @@ def search(query: str, camera: str | None = None, k: int = 10) -> list[dict]:
 def neighbors(segment_id: str) -> tuple[dict | None, dict | None]:
     """Return ``(prev, next)`` segments in the same video, or ``None`` at edges.
 
-    Each segment uses the same dict shape as :func:`search`.
+    Each segment uses the same dict shape as :func:`search`. Ordering is by
+    ``segment_start_sec`` within the parent ``video``.
     """
     if DEMO_MODE:
         return _demo_neighbors(segment_id)
-    # Real VSS path not wired yet — stubs still return fake data.
-    return _demo_neighbors(segment_id)
+    return _vss_neighbors(segment_id)
 
 
 def look(segment_id: str, question: str) -> dict:
