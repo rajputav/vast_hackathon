@@ -21,7 +21,10 @@ from court.llm import chat
 from court.tools import look, neighbors, search
 
 COURT_DIR = Path(__file__).parent
-LEDGER = COURT_DIR / "ledger.jsonl"
+# Where the ledger and hazard reports go. In the pod the code is a read-only ConfigMap
+# mount, so deploy.sh points this at /tmp/court.
+OUT_DIR = Path(os.environ.get("COURT_OUT_DIR", str(COURT_DIR)))
+LEDGER = OUT_DIR / "ledger.jsonl"
 
 # Defense and judge make the calls that decide the verdict. The fast default (8B) mislabeled a
 # truck-vs-bus mismatch as 'scope' in 5 of 6 runs; 70B got 'object' 6 of 6. Prosecutor and
@@ -334,6 +337,32 @@ def _strike_breakdown(records: list[dict]) -> dict[str, int]:
     return counts
 
 
+def iter_trial(claim: str, camera: str | None, k: int, subpoenas: int):
+    """Run a trial, yielding events as the court works so a UI can show it unfolding.
+
+    Events (dicts with a ``type`` key):
+      ``docket``  — ``{"exhibits": n}`` once search() has returned
+      ``exhibit`` — ``{"record": <exhibit record>, "lines": [transcript lines]}`` per exhibit
+      ``verdict`` — ``{"trial": <full trial object>, "lines": [verdict lines]}`` last
+    """
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    records: list[dict] = []
+    budget = subpoenas
+
+    exhibits = search(claim, camera=camera, k=k)
+    yield {"type": "docket", "exhibits": len(exhibits)}
+
+    for n, segment in enumerate(exhibits, start=1):
+        record, budget = try_exhibit(claim, n, segment, camera, budget)
+        records.append(record)
+        with LEDGER.open("a") as f:
+            f.write(json.dumps({"claim": claim, **record}) + "\n")
+        yield {"type": "exhibit", "record": record, "lines": exhibit_lines(record)}
+
+    lines, trial = _verdict(claim, camera, k, subpoenas, budget, records)
+    yield {"type": "verdict", "trial": trial, "lines": lines}
+
+
 def run_trial(claim: str, camera: str | None, k: int, subpoenas: int) -> tuple[list[str], dict]:
     """Try every exhibit search() returns.
 
@@ -341,16 +370,20 @@ def run_trial(claim: str, camera: str | None, k: int, subpoenas: int) -> tuple[l
     under ``exhibits`` plus the verdict, so UIs render the same object the transcript does.
     """
     lines: list[str] = []
-    records: list[dict] = []
-    budget = subpoenas
+    trial: dict = {}
+    for event in iter_trial(claim, camera, k, subpoenas):
+        if event["type"] in ("exhibit", "verdict"):
+            lines.extend(event["lines"])
+        if event["type"] == "verdict":
+            trial = event["trial"]
+    return lines, trial
 
-    for n, segment in enumerate(search(claim, camera=camera, k=k), start=1):
-        record, budget = try_exhibit(claim, n, segment, camera, budget)
-        records.append(record)
-        lines.extend(exhibit_lines(record))
-        with LEDGER.open("a") as f:
-            f.write(json.dumps({"claim": claim, **record}) + "\n")
 
+def _verdict(
+    claim: str, camera: str | None, k: int, subpoenas: int, budget: int, records: list[dict]
+) -> tuple[list[str], dict]:
+    """Tally the records, hear the bailiff, maybe file the report."""
+    lines: list[str] = []
     admitted = [r for r in records if r["disposition"] == "ADMIT"]
     struck = sum(r["disposition"] == "STRIKE" for r in records)
     not_reached = sum(r["disposition"] == "NOT_REACHED" for r in records)
@@ -409,7 +442,8 @@ def run_trial(claim: str, camera: str | None, k: int, subpoenas: int) -> tuple[l
 def write_report(trial: dict) -> str:
     """Hazard report from the trial record: admitted exhibits, then what was struck and why."""
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    path = COURT_DIR / f"report_{stamp}.md"
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    path = OUT_DIR / f"report_{stamp}.md"
     v = trial["verdict"]
     admitted = [r for r in trial["exhibits"] if r["disposition"] == "ADMIT"]
     struck = [r for r in trial["exhibits"] if r["disposition"] != "ADMIT"]
@@ -446,7 +480,10 @@ def write_report(trial: dict) -> str:
         + ("\n".join(struck_row(r) for r in struck) or "| – | – | – | – | none |")
         + "\n"
     )
-    return str(path.relative_to(COURT_DIR.parent))
+    try:
+        return str(path.relative_to(COURT_DIR.parent))
+    except ValueError:  # OUT_DIR outside the repo (e.g. /tmp/court in the pod)
+        return str(path)
 
 
 def main() -> None:

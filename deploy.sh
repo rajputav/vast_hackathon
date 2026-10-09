@@ -32,6 +32,13 @@ echo "==> namespace $NS, host $APP_HOST, app $APP_NAME"
 kubectl -n "$NS" create configmap "${APP_NAME}-code" --from-file="$APP_DIR" \
   --dry-run=client -o yaml | kubectl apply -f -
 
+# court/ is a package; --from-file on a directory is flat and would also sweep up the
+# ledger/report outputs, so mount only its .py files as a second ConfigMap at /pkg/court.
+COURT_FILES=()
+for f in court/*.py; do COURT_FILES+=(--from-file="$f"); done
+kubectl -n "$NS" create configmap "${APP_NAME}-court" "${COURT_FILES[@]}" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
 kubectl -n "$NS" create secret generic "${APP_NAME}-creds" \
   --from-literal=VSS_URL="http://video-backend-service:8000" \
   --from-literal=VSS_USERNAME="$NS" \
@@ -61,9 +68,15 @@ spec:
         image: python:3.12-slim
         imagePullPolicy: IfNotPresent
         ports: [{containerPort: ${APP_PORT}}]
-        env: [{name: PORT, value: "${APP_PORT}"}]
+        env:
+        - {name: PORT, value: "${APP_PORT}"}
+        - {name: COURT_OUT_DIR, value: /tmp/court}   # ConfigMap mounts are read-only
+        - {name: PYTHONPATH, value: /pkg}            # /pkg/court is the court package
         envFrom: [{secretRef: {name: ${APP_NAME}-creds}}]
-        volumeMounts: [{name: code, mountPath: /code}]
+        volumeMounts:
+        - {name: code, mountPath: /code}
+        # Not nested under /code: the ConfigMap volume writer owns that directory.
+        - {name: court, mountPath: /pkg/court}
         workingDir: /code
         command: ["bash", "-c"]
         args:
@@ -81,6 +94,8 @@ spec:
       volumes:
       - name: code
         configMap: {name: ${APP_NAME}-code}
+      - name: court
+        configMap: {name: ${APP_NAME}-court}
 ---
 apiVersion: v1
 kind: Service
