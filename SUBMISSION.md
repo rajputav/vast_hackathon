@@ -1,7 +1,7 @@
 # Exhibit A: the video archive on trial
 
 **Live app:** https://team-47-app.thecosmoslabs.com/app/  
-**Repo:** `<REPO LINK>`  
+**Repo:** https://github.com/rajputav/vast_hackathon  
 **Artifact:** [`transcript.txt`](transcript.txt), a full courtroom transcript from one trial  
 **Team 47:** Avinash Rajput, Pradhyumn Thakur
 
