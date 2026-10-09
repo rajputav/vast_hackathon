@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+
+# court trial outputs
+court/ledger.jsonl
+court/report_*.md
+transcript.txt
